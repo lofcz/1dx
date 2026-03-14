@@ -1,0 +1,50 @@
+{
+  "name": "1dxway",
+  "version": "0.1.2",
+  "description": "One DX Way",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lofcz/1dx.git"
+  },
+  "homepage": "https://github.com/lofcz/1dx",
+  "bugs": {
+    "url": "https://github.com/lofcz/1dx/issues"
+  },
+  "module": "src/cli.ts",
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "1dx": "bin/1dx.js",
+    "1dxway": "bin/1dx.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "bun src/cli.ts start",
+    "install:local": "bun src/cli.ts",
+    "check": "bun src/cli.ts --help",
+    "typecheck": "bunx tsc --noEmit",
+    "prepublishOnly": "bun run typecheck && bun run check"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19.2.14"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "ink": "^6.8.0",
+    "react": "^19.2.4",
+    "smol-toml": "^1.6.0",
+    "zod": "^4.3.6"
+  }
+}
