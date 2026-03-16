@@ -474,6 +474,52 @@ function hasWindowsTerminal() {
 const USE_WINDOWS_TERMINAL = hasWindowsTerminal();
 let savedWindowHandle: string | null = null;
 
+function getWtTabIndex(): number | null {
+  if (!IS_WIN || !USE_WINDOWS_TERMINAL) return null;
+  try {
+    const ps = `
+$result = -1
+$h = @{}
+Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CreationDate |
+  ForEach-Object { $h[[int]$_.ProcessId] = $_ }
+$c = $h[${process.pid}]
+if ($c) {
+  $chain = [System.Collections.Generic.List[int]]::new()
+  $wtPid = -1
+  while ($c) {
+    $chain.Add([int]$c.ProcessId)
+    if ($c.Name -match 'WindowsTerminal') { $wtPid = [int]$c.ProcessId; break }
+    if (-not $h.ContainsKey([int]$c.ParentProcessId)) { break }
+    $c = $h[[int]$c.ParentProcessId]
+  }
+  if ($wtPid -ge 0) {
+    $branch = -1
+    foreach ($id in $chain) {
+      if ([int]$h[$id].ParentProcessId -eq $wtPid) { $branch = $id; break }
+    }
+    if ($branch -ge 0) {
+      $siblings = @($h.Values | Where-Object { [int]$_.ParentProcessId -eq $wtPid } |
+        Sort-Object { if ($_.CreationDate) { $_.CreationDate } else { [DateTime]::MaxValue } }, ProcessId)
+      for ($i = 0; $i -lt $siblings.Count; $i++) {
+        if ([int]$siblings[$i].ProcessId -eq $branch) { $result = $i; break }
+      }
+    }
+  }
+}
+$result`;
+    const encoded = Buffer.from(ps.trim(), "utf16le").toString("base64");
+    const output = execSync(`powershell -NoProfile -EncodedCommand ${encoded}`, {
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 10000,
+    }).trim();
+    const idx = parseInt(output);
+    return isNaN(idx) || idx < 0 ? null : idx;
+  } catch {
+    return null;
+  }
+}
+
 function saveForegroundWindow() {
   if (!IS_WIN) return null;
   try {
@@ -595,29 +641,20 @@ function flushTerminalQueue(projectRoot: string) {
 
   if (IS_WIN && USE_WINDOWS_TERMINAL) {
     savedWindowHandle = saveForegroundWindow();
+    const tabIndex = getWtTabIndex();
     const args = ["-w", "0"];
     terminalQueue.forEach((term, index) => {
       if (index > 0) args.push(";");
       args.push("nt", "--title", term.safeTitle, "-d", projectRoot, "cmd", term.shouldPersistShell ? "/k" : "/c", term.tempFile);
     });
-    const tabsCreated = terminalQueue.length;
-    spawn("wt", args, { detached: true, stdio: "ignore", shell: false, cwd: projectRoot });
+    if (tabIndex !== null) {
+      args.push(";", "ft", "-t", String(tabIndex));
+    }
+    spawnSync("wt", args, { stdio: "ignore", shell: false, cwd: projectRoot, timeout: 15000 });
     terminalQueue.length = 0;
 
     if (savedWindowHandle) {
-      setTimeout(() => {
-        restoreForegroundWindow(savedWindowHandle);
-        setTimeout(() => {
-          restoreForegroundWindow(savedWindowHandle);
-          try {
-            const keys = "^+{TAB}".repeat(tabsCreated);
-            const script = `$wshell = New-Object -ComObject wscript.shell; Start-Sleep -Milliseconds 100; $wshell.SendKeys('${keys}')`;
-            spawn("powershell", ["-NoProfile", "-Command", script], { detached: true, stdio: "ignore" });
-          } catch {
-            // ignore
-          }
-        }, 500);
-      }, 300);
+      setTimeout(() => restoreForegroundWindow(savedWindowHandle), 500);
     }
     return;
   }
@@ -893,21 +930,21 @@ function stopServices(projectRoot: string, services: OneDxService[], options?: {
 
 function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
   ensureRuntimeDirs(projectRoot);
-  try {
-    writeFileSync(getExitFlagPath(projectRoot), "1");
-  } catch {}
+  try { writeFileSync(getExitFlagPath(projectRoot), "1"); } catch {}
 
   signalExitPipe();
-  stopServices(projectRoot, config.services, { includeManagedTerminalShells: true });
-
-  process.stdout.write("\x1b[?25h");
-  process.stdout.write("\x1b[?2026l");
-  process.stdin.setRawMode?.(false);
-  clearMainTerminal();
-  console.log(`\x1b[36m${config.project.name} Dev Monitor stopped.\x1b[0m\nTerminals and configured services have been closed.\n`);
+  stopServices(projectRoot, config.services);
 
   try { unlinkSync(getExitFlagPath(projectRoot)); } catch {}
   try { rmSync(getProjectTempDir(projectRoot), { recursive: true, force: true }); } catch {}
+}
+
+function restoreTerminalAndPrintExit(projectName: string) {
+  process.stdout.write("\x1b[?25h");
+  process.stdout.write("\x1b[?2026l");
+  process.stdin.setRawMode?.(false);
+  process.stdout.write("\x1b[2J\x1b[H");
+  console.log(`\x1b[36m${projectName} Dev Monitor stopped.\x1b[0m\nTerminals and configured services have been closed.\n`);
 }
 
 function clearMainTerminal() {
@@ -1516,13 +1553,17 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
 }
 
 function ExitScreen({ projectRoot, config }: RuntimeOptions) {
+  const { exit } = useApp();
+
   useEffect(() => {
     const timer = setTimeout(() => {
+      exit();
       cleanupRuntime(projectRoot, config);
+      restoreTerminalAndPrintExit(config.project.name);
       process.exit(0);
     }, 0);
     return () => clearTimeout(timer);
-  }, [projectRoot, config]);
+  }, [projectRoot, config, exit]);
 
   return (
     <Box flexDirection="column" padding={1}>
@@ -1559,11 +1600,13 @@ export function startMonitor(projectRoot: string, config: OneDxConfig) {
 
   process.on("SIGINT", () => {
     cleanupRuntime(projectRoot, config);
+    restoreTerminalAndPrintExit(config.project.name);
     process.exit(0);
   });
 
   process.on("SIGTERM", () => {
     cleanupRuntime(projectRoot, config);
+    restoreTerminalAndPrintExit(config.project.name);
     process.exit(0);
   });
 
