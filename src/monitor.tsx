@@ -423,6 +423,40 @@ function getExitFlagPath(projectRoot: string) {
   return join(getProjectTempDir(projectRoot), "exit.flag");
 }
 
+function getExitPipeName(projectRoot: string) {
+  let hash = 0;
+  for (let i = 0; i < projectRoot.length; i++) {
+    hash = ((hash << 5) - hash + projectRoot.charCodeAt(i)) | 0;
+  }
+  return `1dx-exit-${(hash >>> 0).toString(36)}`;
+}
+
+let exitPipeServer: net.Server | null = null;
+const exitPipeClients = new Set<net.Socket>();
+
+function setupExitPipe(projectRoot: string) {
+  if (!IS_WIN) return;
+  const pipePath = `\\\\.\\pipe\\${getExitPipeName(projectRoot)}`;
+  exitPipeServer = net.createServer((socket) => {
+    socket.unref();
+    exitPipeClients.add(socket);
+    socket.on("close", () => exitPipeClients.delete(socket));
+    socket.on("error", () => exitPipeClients.delete(socket));
+  });
+  exitPipeServer.on("error", () => {});
+  exitPipeServer.unref();
+  exitPipeServer.listen(pipePath);
+}
+
+function signalExitPipe() {
+  for (const client of exitPipeClients) {
+    try { client.destroy(); } catch {}
+  }
+  exitPipeClients.clear();
+  try { exitPipeServer?.close(); } catch {}
+  exitPipeServer = null;
+}
+
 function ensureRuntimeDirs(projectRoot: string) {
   mkdirSync(getProjectTempDir(projectRoot), { recursive: true });
 }
@@ -487,7 +521,7 @@ function createTerminalScript(projectRoot: string, id: string, title: string, co
     const isInteractive = command === "cmd" || command === "powershell";
     const executionBlock = isInteractive
       ? `cls\necho.\necho ============================================================\necho   ${title}\necho ============================================================\necho Manual command: ${displayCommand}\necho.\ncmd /k`
-      : `echo.\necho ============================================================\necho   ${title}\necho ============================================================\necho Manual command: ${displayCommand}\necho.\n${command}\necho.\nif exist "${exitFlag}" exit /b 0\necho Process exited. Press any key to close...\npause >nul`;
+      : `echo.\necho ============================================================\necho   ${title}\necho ============================================================\necho Manual command: ${displayCommand}\necho.\n${command}\necho.\nif exist "${exitFlag}" exit /b 0\necho Process exited. Waiting for monitor shutdown...\npowershell -NoProfile -Command "try{$c=[IO.Pipes.NamedPipeClientStream]::new('.','${getExitPipeName(projectRoot)}','In');$c.Connect(60000);$c.ReadByte()|Out-Null;$c.Close()}catch{}"\nexit /b 0`;
     const scriptContent = `@echo off\ntitle ${title}\ncd /d "${projectRoot}"\n${executionBlock}\n`;
     const tempFile = join(tempDir, `.temp-${id}.bat`);
     writeFileSync(tempFile, scriptContent);
@@ -497,7 +531,7 @@ function createTerminalScript(projectRoot: string, id: string, title: string, co
   const isInteractive = command === "bash";
   const executionBlock = isInteractive
     ? `clear\necho ""\necho "============================================================"\necho "  ${title}"\necho "============================================================"\necho "Manual command: ${displayCommand}"\necho ""\nexec bash`
-    : `echo ""\necho "============================================================"\necho "  ${title}"\necho "============================================================"\necho "Manual command: ${displayCommand}"\necho ""\n${command}\necho ""\nif [ -f "${exitFlag}" ]; then exit 0; fi\necho "Process exited. Press Enter to close..."\nread -r`;
+    : `echo ""\necho "============================================================"\necho "  ${title}"\necho "============================================================"\necho "Manual command: ${displayCommand}"\necho ""\n${command}\necho ""\nif [ -f "${exitFlag}" ]; then exit 0; fi\necho "Process exited. Waiting for monitor shutdown..."\nwhile true; do sleep 2; if [ -f "${exitFlag}" ]; then exit 0; fi; done`;
   const scriptContent = `#!/usr/bin/env bash\ncd "${projectRoot}"\n${executionBlock}\n`;
   const tempFile = join(tempDir, `.temp-${id}.sh`);
   writeFileSync(tempFile, scriptContent);
@@ -863,6 +897,7 @@ function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
     writeFileSync(getExitFlagPath(projectRoot), "1");
   } catch {}
 
+  signalExitPipe();
   stopServices(projectRoot, config.services, { includeManagedTerminalShells: true });
 
   process.stdout.write("\x1b[?25h");
@@ -1086,7 +1121,7 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
 }
 
 function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config: OneDxConfig; onExit: () => void }) {
-  const { exit } = useApp();
+  useApp();
   const { rows } = useTerminalSize();
   const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({});
   const [lastUpdate, setLastUpdate] = useState(new Date());
@@ -1278,17 +1313,13 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         busyRef.current = false;
         return;
       case "exit":
-        exit();
-        setTimeout(() => {
-          onExit();
-          process.exit(0);
-        }, 0);
+        onExit();
         return;
       default:
         setBusy(false);
         busyRef.current = false;
     }
-  }, [deadServices, dismissTransientMessage, exit, managedServices, menuItems, onExit, projectRoot, refreshStatuses]);
+  }, [deadServices, dismissTransientMessage, managedServices, menuItems, onExit, projectRoot, refreshStatuses]);
 
   const retryRecovery = useCallback(() => {
     if (!recoveryPrompt) return;
@@ -1484,18 +1515,39 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
   );
 }
 
+function ExitScreen({ projectRoot, config }: RuntimeOptions) {
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      cleanupRuntime(projectRoot, config);
+      process.exit(0);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [projectRoot, config]);
+
+  return (
+    <Box flexDirection="column" padding={1}>
+      <Spinner message={`Closing ${config.project.name} services...`} />
+    </Box>
+  );
+}
+
 function App({ projectRoot, config }: RuntimeOptions) {
-  const [mode, setMode] = useState<"startup" | "monitor">("startup");
+  const [mode, setMode] = useState<"startup" | "monitor" | "exiting">("startup");
 
   if (mode === "startup") {
     return <Startup projectRoot={projectRoot} config={config} onComplete={() => setMode("monitor")} />;
   }
 
-  return <Monitor projectRoot={projectRoot} config={config} onExit={() => cleanupRuntime(projectRoot, config)} />;
+  if (mode === "exiting") {
+    return <ExitScreen projectRoot={projectRoot} config={config} />;
+  }
+
+  return <Monitor projectRoot={projectRoot} config={config} onExit={() => setMode("exiting")} />;
 }
 
 export function startMonitor(projectRoot: string, config: OneDxConfig) {
   ensureRuntimeDirs(projectRoot);
+  setupExitPipe(projectRoot);
   const WritableSyncStdout = SyncStdout({ originalStdout: process.stdout });
   clearMainTerminal();
 
