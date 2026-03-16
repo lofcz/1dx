@@ -765,54 +765,150 @@ function SyncStdout({ originalStdout }: { originalStdout: NodeJS.WriteStream }) 
   };
 }
 
-function killServiceByConfig(service: OneDxService) {
+function escapePowerShellString(value: string) {
+  return value.replace(/'/g, "''");
+}
+
+function runSilentProcess(command: string, args: string[]) {
+  return new Promise<void>((resolve) => {
+    try {
+      const child = spawn(command, args, { stdio: "ignore", shell: false });
+      child.on("error", () => resolve());
+      child.on("close", () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function killServiceByConfigAsync(service: OneDxService) {
   if (service.ambient) return;
 
   const cleanup = service.cleanup;
   if (!cleanup) return;
 
+  const tasks: Array<Promise<void>> = [];
+
   for (const port of cleanup.ports || []) {
     const pid = getProcessOnPort(port);
-    if (pid) killPid(pid);
+    if (!pid) continue;
+    tasks.push(runSilentProcess("kill", ["-9", String(pid)]));
   }
 
   for (const processName of cleanup.processNames || []) {
-    const proc = getProcessByName(processName);
-    if (proc.pid) killPid(proc.pid);
+    tasks.push(runSilentProcess("pkill", ["-f", processName]));
   }
 
-  if (cleanup.commandLineContains && cleanup.commandLineContains.length > 0) {
-    try {
-      if (IS_WIN) {
-        const conditions = cleanup.commandLineContains.map((needle) => `$_.CommandLine -like '*${needle.replace(/'/g, "''")}*'`).join(" -or ");
-        const script = `Get-CimInstance Win32_Process | Where-Object { ${conditions} } | ForEach-Object { taskkill /F /T /PID $_.ProcessId | Out-Null }`;
-        execSync(`powershell -NoProfile -Command "${script}"`, { stdio: "ignore" });
-      } else {
-        for (const needle of cleanup.commandLineContains) {
-          execSync(`pkill -f "${needle}"`, { stdio: "ignore" });
-        }
+  for (const needle of cleanup.commandLineContains || []) {
+    tasks.push(runSilentProcess("pkill", ["-f", needle]));
+  }
+
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks);
+  }
+}
+
+function getManagedServices(services: OneDxService[]) {
+  return services.filter((service) => !service.ambient);
+}
+
+function collectCleanupTargets(services: OneDxService[]) {
+  const managedServices = getManagedServices(services);
+
+  return {
+    services: managedServices,
+    ports: [...new Set(managedServices.flatMap((service) => service.cleanup?.ports || []))],
+    processNames: [...new Set(managedServices.flatMap((service) => service.cleanup?.processNames || []))],
+    commandNeedles: [...new Set(managedServices.flatMap((service) => service.cleanup?.commandLineContains || []))],
+  };
+}
+
+async function killWindowsCleanupTargets(projectRoot: string, services: OneDxService[], includeManagedTerminalShells = false) {
+  const { ports, processNames, commandNeedles } = collectCleanupTargets(services);
+  const tempDir = getProjectTempDir(projectRoot);
+  const script = `
+$self = ${process.pid}
+$ports = @(${ports.join(", ")})
+$processNames = @(${processNames.map((name) => `'${escapePowerShellString(name)}'`).join(", ")})
+$commandNeedles = @(${commandNeedles.map((needle) => `'${escapePowerShellString(needle)}'`).join(", ")})
+$tempDir = '${escapePowerShellString(tempDir)}'
+$targetPids = New-Object 'System.Collections.Generic.HashSet[int]'
+
+if ($ports.Count -gt 0) {
+  Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+    Where-Object { $ports -contains [int]$_.LocalPort } |
+    ForEach-Object { [void]$targetPids.Add([int]$_.OwningProcess) }
+}
+
+$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+
+if ($processNames.Count -gt 0) {
+  foreach ($proc in $processes) {
+    foreach ($name in $processNames) {
+      if ($proc.Name -like "$name*") {
+        [void]$targetPids.Add([int]$proc.ProcessId)
+        break
       }
-    } catch {
-      // ignore
     }
   }
 }
 
-function killManagedTerminalShells(projectRoot: string) {
-  const tempDir = getProjectTempDir(projectRoot).replace(/\\/g, "\\\\");
-  try {
-    if (IS_WIN) {
-      const script = `$self = ${process.pid}; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $self -and $_.CommandLine -match '${tempDir}.*\\\\.temp-' } | ForEach-Object { taskkill /F /T /PID $_.ProcessId | Out-Null }`;
-      execSync(`powershell -NoProfile -Command "${script}"`, { stdio: "ignore" });
-    } else {
-      execSync(`pkill -f "${getProjectTempDir(projectRoot).replace(/"/g, '\\"')}"`, { stdio: "ignore" });
+foreach ($proc in $processes) {
+  if (-not $proc.CommandLine) { continue }
+
+  foreach ($needle in $commandNeedles) {
+    if ($proc.CommandLine -like "*$needle*") {
+      [void]$targetPids.Add([int]$proc.ProcessId)
+      break
     }
-  } catch {
-    // ignore
+  }
+
+  if (${includeManagedTerminalShells ? "$true" : "$false"} -and $proc.ProcessId -ne $self -and $proc.CommandLine -like "*$tempDir*" -and $proc.CommandLine -like "*.temp-*") {
+    [void]$targetPids.Add([int]$proc.ProcessId)
   }
 }
+
+$taskkillArgs = @('/F', '/T')
+foreach ($pid in $targetPids) {
+  if ($pid -and $pid -ne $self) {
+    $taskkillArgs += @('/PID', "$pid")
+  }
+}
+
+if ($taskkillArgs.Count -gt 2) {
+  & taskkill @taskkillArgs | Out-Null
+}
+`;
+
+  await runSilentProcess("powershell", ["-NoProfile", "-Command", script]);
+}
+
+async function killManagedTerminalShellsAsync(projectRoot: string) {
+  if (IS_WIN) return;
+  await runSilentProcess("pkill", ["-f", getProjectTempDir(projectRoot)]);
+}
+
+async function stopServices(projectRoot: string, services: OneDxService[], options?: { includeManagedTerminalShells?: boolean }) {
+  const { services: servicesToCleanup } = collectCleanupTargets(services);
+  if (servicesToCleanup.length === 0) return;
+
+  if (IS_WIN) {
+    await killWindowsCleanupTargets(projectRoot, servicesToCleanup, options?.includeManagedTerminalShells ?? false);
+    return;
+  }
+
+  await Promise.allSettled(servicesToCleanup.map((service) => killServiceByConfigAsync(service)));
+  if (options?.includeManagedTerminalShells) {
+    await killManagedTerminalShellsAsync(projectRoot);
+  }
+}
+
+let cleanupRuntimePromise: Promise<void> | null = null;
 
 function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
+  if (cleanupRuntimePromise) return cleanupRuntimePromise;
+
+  cleanupRuntimePromise = (async () => {
   ensureRuntimeDirs(projectRoot);
   try {
     writeFileSync(getExitFlagPath(projectRoot), "1");
@@ -820,11 +916,7 @@ function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
     // ignore
   }
 
-  for (const service of config.services) {
-    if (service.ambient) continue;
-    killServiceByConfig(service);
-  }
-  killManagedTerminalShells(projectRoot);
+  await stopServices(projectRoot, config.services, { includeManagedTerminalShells: true });
 
   process.stdout.write("\x1b[?25h");
   process.stdout.write("\x1b[?2026l");
@@ -843,6 +935,9 @@ function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
   } catch {
     // ignore
   }
+  })();
+
+  return cleanupRuntimePromise;
 }
 
 function clearMainTerminal() {
@@ -1055,7 +1150,7 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
   );
 }
 
-function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config: OneDxConfig; onExit: () => void }) {
+function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config: OneDxConfig; onExit: () => Promise<void> | void }) {
   const { exit } = useApp();
   const { rows } = useTerminalSize();
   const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({});
@@ -1074,7 +1169,11 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
   const statusesRef = useRef<Record<string, ServiceStatus>>({});
   const [commandKey, setCommandKey] = useState(0);
 
-  const deadServices = config.services.filter((service) => !service.ambient && !statuses[service.id]?.running);
+  const managedServices = useMemo(
+    () => getManagedServices(config.services),
+    [config.services],
+  );
+  const deadServices = managedServices.filter((service) => !statuses[service.id]?.running);
 
   const menuItems = useMemo(() => {
     return config.actions.map((action) => {
@@ -1175,11 +1274,9 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     switch (action.builtIn) {
       case "stop-services":
         setMessage("Stopping all services...");
-        const servicesToStop = config.services.filter((service) => !service.ambient && statusesRef.current[service.id]?.running);
+        const servicesToStop = managedServices.filter((service) => statusesRef.current[service.id]?.running);
         setStoppingServiceIds(servicesToStop.map((service) => service.id));
-        for (const service of servicesToStop) {
-          killServiceByConfig(service);
-        }
+        await stopServices(projectRoot, servicesToStop);
         await refreshStatuses();
         setStoppingServiceIds([]);
         setMessage("✓ Stop commands sent");
@@ -1248,15 +1345,16 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
       case "exit":
         exit();
         setTimeout(() => {
-          onExit();
-          process.exit(0);
+          void Promise.resolve(onExit()).finally(() => {
+            process.exit(0);
+          });
         }, 0);
         return;
       default:
         setBusy(false);
         busyRef.current = false;
     }
-  }, [config, deadServices, dismissTransientMessage, exit, menuItems, onExit, projectRoot, refreshStatuses]);
+  }, [deadServices, dismissTransientMessage, exit, managedServices, menuItems, onExit, projectRoot, refreshStatuses]);
 
   const retryRecovery = useCallback(() => {
     if (!recoveryPrompt) return;
@@ -1474,13 +1572,15 @@ export function startMonitor(projectRoot: string, config: OneDxConfig) {
   });
 
   process.on("SIGINT", () => {
-    cleanupRuntime(projectRoot, config);
-    process.exit(0);
+    void Promise.resolve(cleanupRuntime(projectRoot, config)).finally(() => {
+      process.exit(0);
+    });
   });
 
   process.on("SIGTERM", () => {
-    cleanupRuntime(projectRoot, config);
-    process.exit(0);
+    void Promise.resolve(cleanupRuntime(projectRoot, config)).finally(() => {
+      process.exit(0);
+    });
   });
 
   render(<App projectRoot={projectRoot} config={config} />, {
