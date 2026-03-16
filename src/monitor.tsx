@@ -477,44 +477,39 @@ let savedWindowHandle: string | null = null;
 function getWtTabIndex(): number | null {
   if (!IS_WIN || !USE_WINDOWS_TERMINAL) return null;
   try {
-    const ps = `
-$result = -1
-$h = @{}
-Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,CreationDate |
-  ForEach-Object { $h[[int]$_.ProcessId] = $_ }
-$c = $h[${process.pid}]
-if ($c) {
-  $chain = [System.Collections.Generic.List[int]]::new()
-  $wtPid = -1
-  while ($c) {
-    $chain.Add([int]$c.ProcessId)
-    if ($c.Name -match 'WindowsTerminal') { $wtPid = [int]$c.ProcessId; break }
-    if (-not $h.ContainsKey([int]$c.ParentProcessId)) { break }
-    $c = $h[[int]$c.ParentProcessId]
-  }
-  if ($wtPid -ge 0) {
-    $branch = -1
-    foreach ($id in $chain) {
-      if ([int]$h[$id].ParentProcessId -eq $wtPid) { $branch = $id; break }
+    const raw = execSync(
+      "wmic process get CreationDate,Name,ParentProcessId,ProcessId /format:csv",
+      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: 10000 },
+    );
+    type ProcInfo = { pid: number; ppid: number; name: string; created: string };
+    const procs = new Map<number, ProcInfo>();
+    for (const line of raw.split(/\r?\n/)) {
+      const cols = line.trim().split(",");
+      if (cols.length < 5) continue;
+      const pid = parseInt(cols[4]);
+      const ppid = parseInt(cols[3]);
+      if (isNaN(pid) || isNaN(ppid)) continue;
+      procs.set(pid, { pid, ppid, name: cols[2], created: cols[1] || "" });
     }
-    if ($branch -ge 0) {
-      $siblings = @($h.Values | Where-Object { [int]$_.ParentProcessId -eq $wtPid } |
-        Sort-Object { if ($_.CreationDate) { $_.CreationDate } else { [DateTime]::MaxValue } }, ProcessId)
-      for ($i = 0; $i -lt $siblings.Count; $i++) {
-        if ([int]$siblings[$i].ProcessId -eq $branch) { $result = $i; break }
-      }
+
+    const chain: number[] = [];
+    let cur = procs.get(process.pid);
+    while (cur) {
+      chain.push(cur.pid);
+      if (/WindowsTerminal/i.test(cur.name)) break;
+      cur = procs.get(cur.ppid);
     }
-  }
-}
-$result`;
-    const encoded = Buffer.from(ps.trim(), "utf16le").toString("base64");
-    const output = execSync(`powershell -NoProfile -EncodedCommand ${encoded}`, {
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 10000,
-    }).trim();
-    const idx = parseInt(output);
-    return isNaN(idx) || idx < 0 ? null : idx;
+    if (!cur || !/WindowsTerminal/i.test(cur.name)) return null;
+    const wtPid = cur.pid;
+
+    const branch = chain.find((id) => procs.get(id)?.ppid === wtPid);
+    if (branch === undefined) return null;
+
+    const children = [...procs.values()]
+      .filter((p) => p.ppid === wtPid)
+      .sort((a, b) => a.created.localeCompare(b.created) || a.pid - b.pid);
+    const idx = children.findIndex((c) => c.pid === branch);
+    return idx >= 0 ? idx : null;
   } catch {
     return null;
   }
@@ -642,15 +637,22 @@ function flushTerminalQueue(projectRoot: string) {
   if (IS_WIN && USE_WINDOWS_TERMINAL) {
     savedWindowHandle = saveForegroundWindow();
     const tabIndex = getWtTabIndex();
+
+    if (tabIndex !== null && terminalQueue.length > 0) {
+      const lastTerm = terminalQueue[terminalQueue.length - 1];
+      try {
+        const content = readFileSync(lastTerm.tempFile, "utf8");
+        const callback = `start /b wt -w 0 ft -t ${tabIndex}`;
+        writeFileSync(lastTerm.tempFile, content.replace("@echo off\n", `@echo off\n${callback}\n`));
+      } catch { /* ignore */ }
+    }
+
     const args = ["-w", "0"];
     terminalQueue.forEach((term, index) => {
       if (index > 0) args.push(";");
       args.push("nt", "--title", term.safeTitle, "-d", projectRoot, "cmd", term.shouldPersistShell ? "/k" : "/c", term.tempFile);
     });
-    if (tabIndex !== null) {
-      args.push(";", "ft", "-t", String(tabIndex));
-    }
-    spawnSync("wt", args, { stdio: "ignore", shell: false, cwd: projectRoot, timeout: 15000 });
+    spawn("wt", args, { detached: true, stdio: "ignore", shell: false, cwd: projectRoot });
     terminalQueue.length = 0;
 
     if (savedWindowHandle) {
