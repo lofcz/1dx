@@ -765,158 +765,105 @@ function SyncStdout({ originalStdout }: { originalStdout: NodeJS.WriteStream }) 
   };
 }
 
-function escapePowerShellString(value: string) {
-  return value.replace(/'/g, "''");
-}
-
-function runSilentProcess(command: string, args: string[]) {
-  return new Promise<void>((resolve) => {
-    try {
-      const child = spawn(command, args, { stdio: "ignore", shell: false });
-      child.on("error", () => resolve());
-      child.on("close", () => resolve());
-    } catch {
-      resolve();
-    }
-  });
-}
-
-async function killServiceByConfigAsync(service: OneDxService) {
-  if (service.ambient) return;
-
-  const cleanup = service.cleanup;
-  if (!cleanup) return;
-
-  const tasks: Array<Promise<void>> = [];
-
-  for (const port of cleanup.ports || []) {
-    const pid = getProcessOnPort(port);
-    if (!pid) continue;
-    tasks.push(runSilentProcess("kill", ["-9", String(pid)]));
-  }
-
-  for (const processName of cleanup.processNames || []) {
-    tasks.push(runSilentProcess("pkill", ["-f", processName]));
-  }
-
-  for (const needle of cleanup.commandLineContains || []) {
-    tasks.push(runSilentProcess("pkill", ["-f", needle]));
-  }
-
-  if (tasks.length > 0) {
-    await Promise.allSettled(tasks);
-  }
-}
-
 function getManagedServices(services: OneDxService[]) {
   return services.filter((service) => !service.ambient);
 }
 
 function collectCleanupTargets(services: OneDxService[]) {
-  const managedServices = getManagedServices(services);
-
+  const managed = getManagedServices(services);
   return {
-    services: managedServices,
-    ports: [...new Set(managedServices.flatMap((service) => service.cleanup?.ports || []))],
-    processNames: [...new Set(managedServices.flatMap((service) => service.cleanup?.processNames || []))],
-    commandNeedles: [...new Set(managedServices.flatMap((service) => service.cleanup?.commandLineContains || []))],
+    services: managed,
+    ports: [...new Set(managed.flatMap((s) => s.cleanup?.ports || []))],
+    processNames: [...new Set(managed.flatMap((s) => s.cleanup?.processNames || []))],
+    commandNeedles: [...new Set(managed.flatMap((s) => s.cleanup?.commandLineContains || []))],
   };
 }
 
-async function killWindowsCleanupTargets(projectRoot: string, services: OneDxService[], includeManagedTerminalShells = false) {
-  const { ports, processNames, commandNeedles } = collectCleanupTargets(services);
+function stopServicesWindows(projectRoot: string, targets: ReturnType<typeof collectCleanupTargets>, includeManagedTerminalShells: boolean) {
+  const { ports, processNames, commandNeedles } = targets;
+  const pids = new Set<string>();
+
+  for (const port of ports) {
+    const pid = getProcessOnPort(port);
+    if (pid) pids.add(pid);
+  }
+  for (const name of processNames) {
+    const proc = getProcessByName(name);
+    if (proc.pid) pids.add(proc.pid);
+  }
+
+  if (pids.size > 0) {
+    const pidArgs = [...pids].flatMap((pid) => ["/PID", pid]);
+    try { execSync(`taskkill /F /T ${pidArgs.join(" ")}`, { stdio: "ignore" }); } catch {}
+  }
+
+  const needsCim = commandNeedles.length > 0 || includeManagedTerminalShells;
+  if (!needsCim) return;
+
   const tempDir = getProjectTempDir(projectRoot);
+  const escapeSingle = (v: string) => v.replace(/'/g, "''");
   const script = `
+$ErrorActionPreference = 'SilentlyContinue'
 $self = ${process.pid}
-$ports = @(${ports.join(", ")})
-$processNames = @(${processNames.map((name) => `'${escapePowerShellString(name)}'`).join(", ")})
-$commandNeedles = @(${commandNeedles.map((needle) => `'${escapePowerShellString(needle)}'`).join(", ")})
-$tempDir = '${escapePowerShellString(tempDir)}'
 $targetPids = New-Object 'System.Collections.Generic.HashSet[int]'
+$procs = Get-CimInstance Win32_Process
+foreach ($p in $procs) {
+  if (-not $p.CommandLine) { continue }
+  ${commandNeedles.map((n) => `if ($p.CommandLine -like '*${escapeSingle(n)}*') { [void]$targetPids.Add([int]$p.ProcessId) }`).join("\n  ")}
+  ${includeManagedTerminalShells ? `if ($p.ProcessId -ne $self -and $p.CommandLine -like '*${escapeSingle(tempDir)}*' -and $p.CommandLine -like '*.temp-*') { [void]$targetPids.Add([int]$p.ProcessId) }` : ""}
+}
+[void]$targetPids.Remove($self)
+if ($targetPids.Count -gt 0) {
+  $a = @('/F','/T'); foreach ($id in $targetPids) { $a += '/PID'; $a += "$id" }
+  & taskkill @a 2>&1 | Out-Null
+}`;
 
-if ($ports.Count -gt 0) {
-  Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-    Where-Object { $ports -contains [int]$_.LocalPort } |
-    ForEach-Object { [void]$targetPids.Add([int]$_.OwningProcess) }
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  spawnSync("powershell", ["-NoProfile", "-EncodedCommand", encoded], { stdio: "ignore", timeout: 15000 });
 }
 
-$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+function stopServicesUnix(projectRoot: string, targets: ReturnType<typeof collectCleanupTargets>, includeManagedTerminalShells: boolean) {
+  const { ports, processNames, commandNeedles } = targets;
+  const pids = new Set<string>();
 
-if ($processNames.Count -gt 0) {
-  foreach ($proc in $processes) {
-    foreach ($name in $processNames) {
-      if ($proc.Name -like "$name*") {
-        [void]$targetPids.Add([int]$proc.ProcessId)
-        break
-      }
-    }
+  for (const port of ports) {
+    const pid = getProcessOnPort(port);
+    if (pid) pids.add(pid);
+  }
+  for (const name of processNames) {
+    const proc = getProcessByName(name);
+    if (proc.pid) pids.add(proc.pid);
+  }
+  for (const pid of pids) {
+    killPid(pid);
+  }
+
+  const allNeedles = [...commandNeedles];
+  if (includeManagedTerminalShells) allNeedles.push(getProjectTempDir(projectRoot));
+  for (const needle of allNeedles) {
+    try { execSync(`pkill -f "${needle.replace(/"/g, '\\"')}"`, { stdio: "ignore" }); } catch {}
   }
 }
 
-foreach ($proc in $processes) {
-  if (-not $proc.CommandLine) { continue }
+function stopServices(projectRoot: string, services: OneDxService[], options?: { includeManagedTerminalShells?: boolean }) {
+  const targets = collectCleanupTargets(services);
+  if (targets.services.length === 0 && !options?.includeManagedTerminalShells) return;
 
-  foreach ($needle in $commandNeedles) {
-    if ($proc.CommandLine -like "*$needle*") {
-      [void]$targetPids.Add([int]$proc.ProcessId)
-      break
-    }
-  }
-
-  if (${includeManagedTerminalShells ? "$true" : "$false"} -and $proc.ProcessId -ne $self -and $proc.CommandLine -like "*$tempDir*" -and $proc.CommandLine -like "*.temp-*") {
-    [void]$targetPids.Add([int]$proc.ProcessId)
-  }
-}
-
-$taskkillArgs = @('/F', '/T')
-foreach ($pid in $targetPids) {
-  if ($pid -and $pid -ne $self) {
-    $taskkillArgs += @('/PID', "$pid")
-  }
-}
-
-if ($taskkillArgs.Count -gt 2) {
-  & taskkill @taskkillArgs | Out-Null
-}
-`;
-
-  await runSilentProcess("powershell", ["-NoProfile", "-Command", script]);
-}
-
-async function killManagedTerminalShellsAsync(projectRoot: string) {
-  if (IS_WIN) return;
-  await runSilentProcess("pkill", ["-f", getProjectTempDir(projectRoot)]);
-}
-
-async function stopServices(projectRoot: string, services: OneDxService[], options?: { includeManagedTerminalShells?: boolean }) {
-  const { services: servicesToCleanup } = collectCleanupTargets(services);
-  if (servicesToCleanup.length === 0) return;
-
+  const includeShells = options?.includeManagedTerminalShells ?? false;
   if (IS_WIN) {
-    await killWindowsCleanupTargets(projectRoot, servicesToCleanup, options?.includeManagedTerminalShells ?? false);
-    return;
-  }
-
-  await Promise.allSettled(servicesToCleanup.map((service) => killServiceByConfigAsync(service)));
-  if (options?.includeManagedTerminalShells) {
-    await killManagedTerminalShellsAsync(projectRoot);
+    stopServicesWindows(projectRoot, targets, includeShells);
+  } else {
+    stopServicesUnix(projectRoot, targets, includeShells);
   }
 }
-
-let cleanupRuntimePromise: Promise<void> | null = null;
 
 function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
-  if (cleanupRuntimePromise) return cleanupRuntimePromise;
-
-  cleanupRuntimePromise = (async () => {
   ensureRuntimeDirs(projectRoot);
   try {
     writeFileSync(getExitFlagPath(projectRoot), "1");
-  } catch {
-    // ignore
-  }
+  } catch {}
 
-  await stopServices(projectRoot, config.services, { includeManagedTerminalShells: true });
+  stopServices(projectRoot, config.services, { includeManagedTerminalShells: true });
 
   process.stdout.write("\x1b[?25h");
   process.stdout.write("\x1b[?2026l");
@@ -924,20 +871,8 @@ function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
   clearMainTerminal();
   console.log(`\x1b[36m${config.project.name} Dev Monitor stopped.\x1b[0m\nTerminals and configured services have been closed.\n`);
 
-  try {
-    unlinkSync(getExitFlagPath(projectRoot));
-  } catch {
-    // ignore
-  }
-
-  try {
-    rmSync(getProjectTempDir(projectRoot), { recursive: true, force: true });
-  } catch {
-    // ignore
-  }
-  })();
-
-  return cleanupRuntimePromise;
+  try { unlinkSync(getExitFlagPath(projectRoot)); } catch {}
+  try { rmSync(getProjectTempDir(projectRoot), { recursive: true, force: true }); } catch {}
 }
 
 function clearMainTerminal() {
@@ -1150,7 +1085,7 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
   );
 }
 
-function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config: OneDxConfig; onExit: () => Promise<void> | void }) {
+function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config: OneDxConfig; onExit: () => void }) {
   const { exit } = useApp();
   const { rows } = useTerminalSize();
   const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({});
@@ -1276,7 +1211,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         setMessage("Stopping all services...");
         const servicesToStop = managedServices.filter((service) => statusesRef.current[service.id]?.running);
         setStoppingServiceIds(servicesToStop.map((service) => service.id));
-        await stopServices(projectRoot, servicesToStop);
+        stopServices(projectRoot, servicesToStop);
         await refreshStatuses();
         setStoppingServiceIds([]);
         setMessage("✓ Stop commands sent");
@@ -1345,9 +1280,8 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
       case "exit":
         exit();
         setTimeout(() => {
-          void Promise.resolve(onExit()).finally(() => {
-            process.exit(0);
-          });
+          onExit();
+          process.exit(0);
         }, 0);
         return;
       default:
@@ -1572,15 +1506,13 @@ export function startMonitor(projectRoot: string, config: OneDxConfig) {
   });
 
   process.on("SIGINT", () => {
-    void Promise.resolve(cleanupRuntime(projectRoot, config)).finally(() => {
-      process.exit(0);
-    });
+    cleanupRuntime(projectRoot, config);
+    process.exit(0);
   });
 
   process.on("SIGTERM", () => {
-    void Promise.resolve(cleanupRuntime(projectRoot, config)).finally(() => {
-      process.exit(0);
-    });
+    cleanupRuntime(projectRoot, config);
+    process.exit(0);
   });
 
   render(<App projectRoot={projectRoot} config={config} />, {
