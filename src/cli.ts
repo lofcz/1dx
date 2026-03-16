@@ -3,6 +3,7 @@
 import { findProjectRoot, loadOneDxConfig } from "./config.ts";
 import { runInstaller } from "./install.tsx";
 import { startMonitor } from "./monitor.tsx";
+import { printSqlHelp, runSqlCommand } from "./sql.ts";
 
 const command = process.argv[2];
 
@@ -13,11 +14,13 @@ function printHelp() {
 \x1b[33mUsage:\x1b[0m
   bunx 1dxway
   bunx 1dxway start
+  bunx 1dxway sql "SELECT * FROM pg_tables"
   bunx 1dxway help
 
 \x1b[33mCommands:\x1b[0m
   \x1b[32m(default)\x1b[0m  Run the interactive installer in the current project
   \x1b[32mstart\x1b[0m      Start the 1dx monitor using ./1dx.json
+  \x1b[32msql\x1b[0m        Execute a SQL query through the local Supabase CLI
   \x1b[32mhelp\x1b[0m       Show this help message
 `);
 }
@@ -39,6 +42,14 @@ switch (command) {
     }
     break;
   }
+
+  case "sql":
+    if (process.argv.includes("--help") || process.argv.includes("-h")) {
+      printSqlHelp();
+      break;
+    }
+    runSqlCommand(process.argv.slice(3));
+    break;
 
   case "help":
   case "--help":

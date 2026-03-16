@@ -1119,12 +1119,19 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     return () => clearInterval(interval);
   }, [refreshStatuses]);
 
-  const dismissTransientMessage = useCallback((delayMs = 2000) => {
+  const dismissTransientMessage = useCallback((delayMs = 2000, releaseBusyImmediately = false) => {
+    if (releaseBusyImmediately) {
+      setBusy(false);
+      busyRef.current = false;
+    }
+
     setTimeout(() => {
       setMessage(null);
       setStoppingServiceIds([]);
-      setBusy(false);
-      busyRef.current = false;
+      if (!releaseBusyImmediately) {
+        setBusy(false);
+        busyRef.current = false;
+      }
     }, delayMs);
   }, []);
 
@@ -1176,7 +1183,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         await refreshStatuses();
         setStoppingServiceIds([]);
         setMessage("✓ Stop commands sent");
-        dismissTransientMessage();
+        dismissTransientMessage(2000, true);
         return;
       case "start-dead":
         if (deadServices.length === 0) {
@@ -1193,10 +1200,10 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         setMessage(`✓ Started: ${deadServices.map((service) => service.id).join(", ")}`);
         setTimeout(() => {
           setMessage(null);
-          setBusy(false);
-          busyRef.current = false;
           refreshStatuses();
         }, 2000);
+        setBusy(false);
+        busyRef.current = false;
         return;
       case "open-url":
         if (!action.url) {
@@ -1206,12 +1213,12 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         } else {
           setMessage(`Open manually: ${action.url}`);
         }
-        dismissTransientMessage();
+        dismissTransientMessage(2000, true);
         return;
       case "open-frontend":
         if (!config.project.frontendUrl) {
           setMessage("No frontend URL configured");
-          dismissTransientMessage();
+          dismissTransientMessage(2000, true);
           return;
         }
         const ready = await waitForUrlReady([
@@ -1225,13 +1232,13 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         } else {
           setMessage(`Open manually: ${config.project.frontendUrl}`);
         }
-        dismissTransientMessage();
+        dismissTransientMessage(2000, true);
         return;
       case "new-terminal":
         spawnTerminal(projectRoot, `custom-term-${Date.now()}`, `${config.project.name} Terminal`, IS_WIN ? "cmd" : "bash", "Interactive shell");
         flushTerminalQueue(projectRoot);
         setMessage("✓ Opened new terminal tab");
-        dismissTransientMessage();
+        dismissTransientMessage(2000, true);
         return;
       case "refresh":
         await refreshStatuses();
