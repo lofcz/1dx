@@ -570,7 +570,7 @@ function spawnTerminal(projectRoot: string, id: string, title: string, command: 
   spawn("bash", [tempFile], { detached: true, stdio: "ignore", cwd: projectRoot }).unref();
 }
 
-function flushTerminalQueue(projectRoot: string) {
+function flushTerminalQueue(projectRoot: string, options?: { restoreFocus?: boolean }) {
   if (terminalQueue.length === 0) return;
 
   if (IS_WIN && USE_WINDOWS_TERMINAL) {
@@ -582,7 +582,9 @@ function flushTerminalQueue(projectRoot: string) {
     spawn("wt", args, { detached: true, stdio: "ignore", shell: false, cwd: projectRoot }).unref();
     terminalQueue.length = 0;
 
-    setTimeout(() => focusWtTab(0), 500);
+    if (options?.restoreFocus) {
+      setTimeout(() => focusWtTab(0), 500);
+    }
     return;
   }
 
@@ -1039,7 +1041,7 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
         addLog(service.color || "white", `Queued: ${service.title}`);
       }
 
-      flushTerminalQueue(projectRoot);
+      flushTerminalQueue(projectRoot, { restoreFocus: true });
       addLog("cyan", "Spawned all terminals");
 
       if (config.startup?.autoOpenFrontend && config.project.frontendUrl) {
