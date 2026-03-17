@@ -423,12 +423,16 @@ function getExitFlagPath(projectRoot: string) {
   return join(getProjectTempDir(projectRoot), "exit.flag");
 }
 
-function getExitPipeName(projectRoot: string) {
+function getProjectRuntimeId(projectRoot: string) {
   let hash = 0;
   for (let i = 0; i < projectRoot.length; i++) {
     hash = ((hash << 5) - hash + projectRoot.charCodeAt(i)) | 0;
   }
-  return `1dx-exit-${(hash >>> 0).toString(36)}`;
+  return (hash >>> 0).toString(36);
+}
+
+function getExitPipeName(projectRoot: string) {
+  return `1dx-exit-${getProjectRuntimeId(projectRoot)}`;
 }
 
 let exitPipeServer: net.Server | null = null;
@@ -472,71 +476,10 @@ function hasWindowsTerminal() {
 }
 
 const USE_WINDOWS_TERMINAL = hasWindowsTerminal();
-let savedWindowHandle: string | null = null;
 
-function getWtTabIndex(): number | null {
-  if (!IS_WIN || !USE_WINDOWS_TERMINAL) return null;
-  try {
-    const raw = execSync(
-      "wmic process get CreationDate,Name,ParentProcessId,ProcessId /format:csv",
-      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: 10000 },
-    );
-    type ProcInfo = { pid: number; ppid: number; name: string; created: string };
-    const procs = new Map<number, ProcInfo>();
-    for (const line of raw.split(/\r?\n/)) {
-      const cols = line.trim().split(",");
-      if (cols.length < 5) continue;
-      const pid = parseInt(cols[4]);
-      const ppid = parseInt(cols[3]);
-      if (isNaN(pid) || isNaN(ppid)) continue;
-      procs.set(pid, { pid, ppid, name: cols[2], created: cols[1] || "" });
-    }
-
-    const chain: number[] = [];
-    let cur = procs.get(process.pid);
-    while (cur) {
-      chain.push(cur.pid);
-      if (/WindowsTerminal/i.test(cur.name)) break;
-      cur = procs.get(cur.ppid);
-    }
-    if (!cur || !/WindowsTerminal/i.test(cur.name)) return null;
-    const wtPid = cur.pid;
-
-    const branch = chain.find((id) => procs.get(id)?.ppid === wtPid);
-    if (branch === undefined) return null;
-
-    const children = [...procs.values()]
-      .filter((p) => p.ppid === wtPid)
-      .sort((a, b) => a.created.localeCompare(b.created) || a.pid - b.pid);
-    const idx = children.findIndex((c) => c.pid === branch);
-    return idx >= 0 ? idx : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveForegroundWindow() {
-  if (!IS_WIN) return null;
-  try {
-    const script = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class FgWin{[DllImport("user32.dll")]public static extern IntPtr GetForegroundWindow();}';[FgWin]::GetForegroundWindow().ToInt64()`;
-    const handle = execSync(`powershell -NoProfile -Command "${script}"`, {
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-    return handle && handle !== "0" ? handle : null;
-  } catch {
-    return null;
-  }
-}
-
-function restoreForegroundWindow(handle: string | null) {
-  if (!IS_WIN || !handle) return;
-  try {
-    const script = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class FgWin{[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("user32.dll")]public static extern bool ShowWindow(IntPtr h,int c);}';[FgWin]::ShowWindow([IntPtr]::new(${handle}),9);[FgWin]::SetForegroundWindow([IntPtr]::new(${handle}))`;
-    execSync(`powershell -NoProfile -Command "${script}"`, { stdio: "pipe" });
-  } catch {
-    // ignore
-  }
+function focusWtTab(index: number) {
+  if (!IS_WIN || !USE_WINDOWS_TERMINAL) return;
+  spawn("wt", ["-w", "0", "ft", "-t", String(index)], { detached: true, stdio: "ignore", shell: false }).unref();
 }
 
 function findLinuxTerminal() {
@@ -593,16 +536,12 @@ function spawnTerminal(projectRoot: string, id: string, title: string, command: 
       return;
     }
 
-    const windowHandle = saveForegroundWindow();
     spawn("cmd", ["/c", "start", "/min", `"${title}"`, "cmd", shouldPersistShell ? "/k" : "/c", tempFile], {
       detached: true,
       stdio: "ignore",
       shell: true,
       cwd: projectRoot,
     });
-    if (windowHandle) {
-      setTimeout(() => restoreForegroundWindow(windowHandle), 200);
-    }
     return;
   }
 
@@ -635,29 +574,15 @@ function flushTerminalQueue(projectRoot: string) {
   if (terminalQueue.length === 0) return;
 
   if (IS_WIN && USE_WINDOWS_TERMINAL) {
-    savedWindowHandle = saveForegroundWindow();
-    const tabIndex = getWtTabIndex();
-
-    if (tabIndex !== null && terminalQueue.length > 0) {
-      const lastTerm = terminalQueue[terminalQueue.length - 1];
-      try {
-        const content = readFileSync(lastTerm.tempFile, "utf8");
-        const callback = `start /b wt -w 0 ft -t ${tabIndex}`;
-        writeFileSync(lastTerm.tempFile, content.replace("@echo off\n", `@echo off\n${callback}\n`));
-      } catch { /* ignore */ }
-    }
-
     const args = ["-w", "0"];
     terminalQueue.forEach((term, index) => {
       if (index > 0) args.push(";");
       args.push("nt", "--title", term.safeTitle, "-d", projectRoot, "cmd", term.shouldPersistShell ? "/k" : "/c", term.tempFile);
     });
-    spawn("wt", args, { detached: true, stdio: "ignore", shell: false, cwd: projectRoot });
+    spawn("wt", args, { detached: true, stdio: "ignore", shell: false, cwd: projectRoot }).unref();
     terminalQueue.length = 0;
 
-    if (savedWindowHandle) {
-      setTimeout(() => restoreForegroundWindow(savedWindowHandle), 500);
-    }
+    setTimeout(() => focusWtTab(0), 500);
     return;
   }
 
