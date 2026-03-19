@@ -1415,7 +1415,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     { isActive: !busy || waitingForKey || recoveryPrompt !== null },
   );
 
-  if (waitingForKey && busyRef.current) {
+  if (waitingForKey && busyRef.current && !activeCommandRef.current) {
     return null;
   }
 
