@@ -259,15 +259,33 @@ export function detectSciobotPreset(projectRoot: string): OneDxConfig {
   const { apiPort, studioPort } = detectSupabasePorts(projectRoot);
   const hasI18n = Boolean(pkg.scripts?.i18n);
   const hasSupabase = existsSync(join(projectRoot, "supabase", "config.toml"));
+  const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+  const has1tube = Boolean(allDeps["1tube"]);
   const frontendPortRef = variableRef("frontendPort");
   const supabaseApiPortRef = variableRef("supabaseApiPort");
   const supabaseStudioPortRef = variableRef("supabaseStudioPort");
-  const variables = {
+  const edgePortRef = variableRef("edgePort");
+  const variables: Record<string, string | number | boolean> = {
     frontendPort: vitePort,
     supabaseApiPort: apiPort,
     supabaseStudioPort: studioPort,
   };
+
+  if (has1tube) {
+    variables.edgePort = 3100;
+  }
+
   const frontendUrl = `http://localhost:${frontendPortRef}`;
+
+  const backendShellSuffix = has1tube
+    ? "echo Supabase started. This terminal can be closed."
+    : "bun run supabase:functions:serve";
+  const backendManualCommand = has1tube
+    ? "echo Supabase is already running."
+    : "bun run supabase:functions:serve";
+  const backendCleanup = has1tube
+    ? ["supabase start"]
+    : ["supabase functions serve", "supabase:functions:serve"];
 
   const services: OneDxService[] = [
     {
@@ -299,31 +317,53 @@ export function detectSciobotPreset(projectRoot: string): OneDxConfig {
           "  timeout /t 5 /nobreak >nul",
           "  goto supabase_start_retry",
           ")",
-          "bun run supabase:functions:serve",
+          backendShellSuffix,
         ].join("\n"),
-        manualCommand: "bun run supabase:functions:serve",
+        manualCommand: backendManualCommand,
       },
       startPolicy: "always-on-startup",
       cleanup: {
-        commandLineContains: ["supabase functions serve", "supabase:functions:serve"],
-      },
-    },
-    {
-      id: "frontend",
-      title: "Frontend (Vite)",
-      color: "green",
-      ambient: false,
-      health: { type: "port", port: frontendPortRef as any },
-      start: {
-        shellCommand: "bun run dev",
-      },
-      startPolicy: "if-dead",
-      cleanup: {
-        ports: [frontendPortRef as any],
-        commandLineContains: ["vite", "bun run dev"],
+        commandLineContains: backendCleanup,
       },
     },
   ];
+
+  if (has1tube) {
+    services.push({
+      id: "edge",
+      title: "Edge Functions (1tube)",
+      color: "cyan",
+      ambient: false,
+      health: { type: "port", port: edgePortRef as any },
+      start: {
+        shellCommand: [
+          `set PORT=${edgePortRef}`,
+          "bun run edge:serve",
+        ].join("\n"),
+      },
+      startPolicy: "if-dead",
+      cleanup: {
+        ports: [edgePortRef as any],
+        commandLineContains: ["edge:serve", "1tube/src/server.ts"],
+      },
+    });
+  }
+
+  services.push({
+    id: "frontend",
+    title: "Frontend (Vite)",
+    color: "green",
+    ambient: false,
+    health: { type: "port", port: frontendPortRef as any },
+    start: {
+      shellCommand: "bun run dev",
+    },
+    startPolicy: "if-dead",
+    cleanup: {
+      ports: [frontendPortRef as any],
+      commandLineContains: ["vite", "bun run dev"],
+    },
+  });
 
   if (hasI18n) {
     services.push({
