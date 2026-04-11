@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { render, Box, Text, useApp, useInput, useStdout } from "ink";
+import { render, Box, Text, useApp, useInput, useWindowSize } from "ink";
 import stream from "stream";
 import net from "net";
 import { arch, platform } from "os";
@@ -50,27 +50,6 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function useTerminalSize() {
-  const { stdout } = useStdout();
-  const [size, setSize] = useState({
-    columns: stdout?.columns || 80,
-    rows: stdout?.rows || 24,
-  });
-
-  useEffect(() => {
-    if (!stdout) return;
-    const onResize = () => {
-      setSize({ columns: stdout.columns, rows: stdout.rows });
-    };
-    stdout.on("resize", onResize);
-    return () => {
-      stdout.off("resize", onResize);
-    };
-  }, [stdout]);
-
-  return size;
 }
 
 function Spinner({ message, color = "yellow" }: { message: string; color?: string }) {
@@ -745,6 +724,7 @@ function getSupabaseMigrationOrderingGuard(output: string) {
 function SyncStdout({ originalStdout }: { originalStdout: NodeJS.WriteStream }) {
   return class extends stream.Writable {
     originalStdout = originalStdout;
+    isTTY = originalStdout.isTTY;
     columns = originalStdout.columns;
     rows = originalStdout.rows;
 
@@ -1073,6 +1053,9 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
 
   return (
     <Box flexDirection="column" padding={1}>
+      <Text bold color="cyan">{config.project.name} / 1dx {ONE_DX_VERSION}</Text>
+      <Text dimColor>{"─".repeat(45)}</Text>
+      {logs.length === 0 && <Spinner message="Initializing..." />}
       {logs.map((log, index) => (
         <Text key={`${index}-${log.text}`} color={log.color}>{log.text}</Text>
       ))}
@@ -1088,7 +1071,7 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
 
 function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config: OneDxConfig; onExit: () => void }) {
   useApp();
-  const { rows } = useTerminalSize();
+  const { rows } = useWindowSize();
   const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({});
   const [lastUpdate, setLastUpdate] = useState(new Date());
   const [message, setMessage] = useState<string | null>(null);

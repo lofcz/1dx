@@ -1,0 +1,93 @@
+{
+  "variables": {
+    "apiPort": 4001,
+    "workerPort": 4002
+  },
+  "project": {
+    "name": "1dx Playground",
+    "packageManager": "bun",
+    "frontendUrl": "http://localhost:${apiPort}",
+    "dependencyInstallCommand": ["bun", "install"]
+  },
+  "startup": {
+    "autoInstallDependencies": false,
+    "autoOpenFrontend": false,
+    "frontendServiceId": "api"
+  },
+  "services": [
+    {
+      "id": "api",
+      "title": "API Server",
+      "color": "green",
+      "health": { "type": "port", "port": "${apiPort}" },
+      "start": {
+        "shellCommand": "set PORT=${apiPort} && bun run mock-server.ts",
+        "manualCommand": "PORT=${apiPort} bun run mock-server.ts"
+      },
+      "startPolicy": "if-dead",
+      "cleanup": {
+        "ports": ["${apiPort}"],
+        "commandLineContains": ["mock-server.ts"]
+      }
+    },
+    {
+      "id": "worker",
+      "title": "Worker Server",
+      "color": "magenta",
+      "health": { "type": "port", "port": "${workerPort}" },
+      "start": {
+        "shellCommand": "set PORT=${workerPort} && bun run mock-server.ts",
+        "manualCommand": "PORT=${workerPort} bun run mock-server.ts"
+      },
+      "startPolicy": "if-dead",
+      "cleanup": {
+        "ports": ["${workerPort}"],
+        "commandLineContains": ["mock-server.ts"]
+      }
+    }
+  ],
+  "actions": [
+    {
+      "id": "start-dead",
+      "label": "Start dead services",
+      "shortcut": "1",
+      "mode": "internal",
+      "builtIn": "start-dead"
+    },
+    {
+      "id": "stop",
+      "label": "Stop all services",
+      "shortcut": "2",
+      "mode": "internal",
+      "builtIn": "stop-services"
+    },
+    {
+      "id": "refresh",
+      "label": "Refresh status",
+      "shortcut": "3",
+      "mode": "internal",
+      "builtIn": "refresh"
+    },
+    {
+      "id": "frontend",
+      "label": "Open in browser",
+      "shortcut": "f",
+      "mode": "internal",
+      "builtIn": "open-frontend"
+    },
+    {
+      "id": "terminal",
+      "label": "Open new terminal",
+      "shortcut": "t",
+      "mode": "internal",
+      "builtIn": "new-terminal"
+    },
+    {
+      "id": "exit",
+      "label": "Exit monitor",
+      "shortcut": "q",
+      "mode": "internal",
+      "builtIn": "exit"
+    }
+  ]
+}
