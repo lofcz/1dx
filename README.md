@@ -1,3 +1,5 @@
+![NPM Version](https://img.shields.io/npm/v/1dxway)
+
 # 1dx
 
 One DX Way.
