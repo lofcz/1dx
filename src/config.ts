@@ -41,6 +41,12 @@ const ServiceSchema = z.object({
   health: HealthSchema.optional(),
   start: StartSchema.optional(),
   startPolicy: z.enum(["if-dead", "always-on-startup"]).optional().default("if-dead"),
+  // What to do when the service's health port is already in use at startup.
+  // omitted / "ignore" (default): treat the port as an already-running instance
+  // and skip. "kill": free the port (kill whatever holds it) and start a fresh
+  // instance -- useful when a stale dev server or another project squats on the
+  // same port.
+  onPortInUse: z.enum(["ignore", "kill"]).optional(),
   cleanup: CleanupSchema.optional(),
 });
 
@@ -60,10 +66,15 @@ const ActionSchema = z.object({
   label: z.string().min(1),
   shortcut: z.string().min(1),
   mode: z.enum(["inline", "external", "internal"]),
-  builtIn: z.enum(["start-dead", "stop-services", "refresh", "open-frontend", "open-url", "new-terminal", "exit"]).optional(),
+  builtIn: z.enum(["start-dead", "stop-services", "refresh", "open-frontend", "open-url", "new-terminal", "kill-port", "exit"]).optional(),
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   url: z.string().optional(),
+  // For builtIn: "kill-port" -- which port(s) to free. Provide an explicit
+  // `port`, target a service's health port via `serviceId`, or omit both to
+  // free every managed service's configured port(s).
+  port: z.number().int().positive().optional(),
+  serviceId: z.string().optional(),
   onSuccess: ActionCommandSchema.optional(),
   recovery: RecoverySchema.optional(),
 });

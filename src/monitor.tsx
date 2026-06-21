@@ -8,6 +8,7 @@ import { arch, platform } from "os";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { execSync, spawn, spawnSync } from "child_process";
+import { killPortProcess } from "kill-port-process";
 import type { OneDxAction, OneDxConfig, OneDxService } from "./config.ts";
 
 const IS_WIN = platform() === "win32";
@@ -600,26 +601,72 @@ function flushTerminalQueue(projectRoot: string, options?: { restoreFocus?: bool
 }
 
 function isPortInUse(port: number) {
+  // Probe by CONNECTING, not by trying to listen. A listen-based check gives
+  // false negatives on Windows: listen(port) with no host binds `::` with
+  // IPV6_V6ONLY on, so it never collides with a service bound to IPv4
+  // 127.0.0.1 (uvicorn --host 127.0.0.1, Vite on localhost, ...). That made
+  // such services read as STOPPED while running -- which in turn made startup
+  // and "start dead services" spawn duplicate tabs forever. Connecting to both
+  // loopback addresses detects a listener regardless of its address family.
   return new Promise<boolean>((resolve) => {
-    const server = net.createServer();
-    server.once("error", (error: NodeJS.ErrnoException) => resolve(error.code === "EADDRINUSE"));
-    server.once("listening", () => {
-      server.close();
-      resolve(false);
-    });
-    server.listen(port);
+    const hosts = ["127.0.0.1", "::1"];
+    let remaining = hosts.length;
+    let settled = false;
+    const finish = (inUse: boolean) => {
+      if (settled) return;
+      if (inUse) {
+        settled = true;
+        resolve(true);
+        return;
+      }
+      remaining -= 1;
+      if (remaining === 0) {
+        settled = true;
+        resolve(false);
+      }
+    };
+    for (const host of hosts) {
+      const socket = net.connect({ host, port });
+      socket.setTimeout(1000);
+      socket.once("connect", () => {
+        socket.destroy();
+        finish(true);
+      });
+      socket.once("timeout", () => {
+        socket.destroy();
+        finish(false);
+      });
+      socket.once("error", () => {
+        socket.destroy();
+        finish(false);
+      });
+    }
   });
 }
 
 function getProcessOnPort(port: number) {
   try {
     if (IS_WIN) {
-      const output = execSync(`netstat -ano | findstr :${port} | findstr LISTENING`, {
+      // Parse netstat ourselves instead of `findstr :<port>`. findstr does a
+      // substring match, so a query for :6553 also matches a listener on
+      // :65535 (and the port can appear in the foreign-address column too) --
+      // which could return, and later kill, the wrong PID. Here we match the
+      // LISTENING row whose LOCAL address ends in exactly :<port>.
+      const output = execSync("netstat -ano -p TCP", {
         encoding: "utf8",
         stdio: ["pipe", "pipe", "pipe"],
       });
-      const parts = output.trim().split("\n")[0]?.trim().split(/\s+/);
-      return parts?.[parts.length - 1] || null;
+      const wanted = String(port);
+      for (const line of output.split(/\r?\n/)) {
+        const parts = line.trim().split(/\s+/);
+        // columns: Proto  LocalAddress  ForeignAddress  State  PID
+        if (parts.length < 5 || parts[3] !== "LISTENING") continue;
+        const local = parts[1];
+        if (local.slice(local.lastIndexOf(":") + 1) === wanted) {
+          return parts[4] || null;
+        }
+      }
+      return null;
     }
 
     const output = execSync(`lsof -i :${port} -t -sTCP:LISTEN`, {
@@ -672,11 +719,35 @@ function killPid(pid: string | number) {
 }
 
 async function killPort(port: number) {
-  const pid = getProcessOnPort(port);
-  if (!pid) return false;
-  if (!killPid(pid)) return false;
-  await sleep(1000);
-  return true;
+  if (!(await isPortInUse(port))) return false;
+  // Prefer kill-port-process: a maintained cross-platform killer that resolves
+  // IPv4/IPv6 listeners and the owning process the same way on every OS. Fall
+  // back to 1dx's native taskkill/kill path if it throws (or isn't usable).
+  try {
+    await killPortProcess(port, { signal: "SIGKILL", silent: true });
+  } catch {
+    const pid = getProcessOnPort(port);
+    if (pid) killPid(pid);
+  }
+  await sleep(800);
+  return !(await isPortInUse(port));
+}
+
+function resolveKillPorts(action: OneDxAction, managed: OneDxService[]): number[] {
+  if (typeof action.port === "number") return [action.port];
+  if (action.serviceId) {
+    const svc = managed.find((service) => service.id === action.serviceId);
+    if (svc?.health?.type === "port") return [svc.health.port];
+    return [...new Set(svc?.cleanup?.ports ?? [])];
+  }
+  return [
+    ...new Set(
+      managed.flatMap((service) => [
+        ...(service.health?.type === "port" ? [service.health.port] : []),
+        ...(service.cleanup?.ports ?? []),
+      ]),
+    ),
+  ];
 }
 
 function areStatusesEqual(left: Record<string, ServiceStatus>, right: Record<string, ServiceStatus>) {
@@ -1012,7 +1083,17 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
       addLog("cyan", "\nSpawning terminals...\n");
       for (const service of config.services) {
         if (!service.start) continue;
-        const running = statuses[service.id]?.running;
+        let running = statuses[service.id]?.running;
+
+        // onPortInUse: "kill" -> reclaim the port from whatever holds it (a
+        // stale dev server, another project on the same port) so this service
+        // can bind, instead of being skipped as "already running".
+        if (running && service.onPortInUse === "kill" && service.health?.type === "port") {
+          addLog(service.color || "white", `Port ${service.health.port} busy -- freeing it for ${service.title}`);
+          await killPort(service.health.port);
+          running = false;
+        }
+
         const shouldStart = service.startPolicy === "always-on-startup" || !running;
         if (!shouldStart) continue;
 
@@ -1264,6 +1345,27 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         setMessage("✓ Opened new terminal tab");
         dismissTransientMessage(2000, true);
         return;
+      case "kill-port": {
+        const ports = resolveKillPorts(action, managedServices);
+        if (ports.length === 0) {
+          setMessage("No port configured to free");
+          dismissTransientMessage(2000, true);
+          return;
+        }
+        setMessage(`Freeing port${ports.length > 1 ? "s" : ""} ${ports.join(", ")}...`);
+        let freed = 0;
+        for (const targetPort of ports) {
+          if (await killPort(targetPort)) freed += 1;
+        }
+        await refreshStatuses();
+        setMessage(
+          freed > 0
+            ? `✓ Freed ${freed} port${freed > 1 ? "s" : ""} (${ports.join(", ")})`
+            : `Nothing was listening on ${ports.join(", ")}`,
+        );
+        dismissTransientMessage(2000, true);
+        return;
+      }
       case "refresh":
         await refreshStatuses();
         setBusy(false);
