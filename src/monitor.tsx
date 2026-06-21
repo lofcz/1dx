@@ -475,6 +475,21 @@ function findLinuxTerminal() {
   return null;
 }
 
+// cmd.exe treats & | < > ^ as command operators even inside an `echo` argument.
+// Service titles and manual commands are echoed verbatim into the generated
+// .bat, so an unescaped `&&` (e.g. "cd web && npm run dev") would be EXECUTED
+// instead of printed -- and if that resolves to another `1dx start` it
+// recursively respawns the entire stack. Escape so echo/title print literally.
+function escapeBatchEcho(text: string) {
+  return text.replace(/[\^&<>|]/g, (char) => `^${char}`);
+}
+
+// In bash the header lines are wrapped in double quotes; escape the characters
+// that remain special inside a double-quoted string.
+function escapeBashDquote(text: string) {
+  return text.replace(/[\\"`$]/g, (char) => `\\${char}`);
+}
+
 function createTerminalScript(projectRoot: string, id: string, title: string, command: string, manualCommand?: string) {
   ensureRuntimeDirs(projectRoot);
   const displayCommand = manualCommand || command;
@@ -483,19 +498,23 @@ function createTerminalScript(projectRoot: string, id: string, title: string, co
 
   if (IS_WIN) {
     const isInteractive = command === "cmd" || command === "powershell";
+    const safeTitle = escapeBatchEcho(title);
+    const safeManual = escapeBatchEcho(displayCommand);
     const executionBlock = isInteractive
-      ? `cls\necho.\necho ============================================================\necho   ${title}\necho ============================================================\necho Manual command: ${displayCommand}\necho.\ncmd /k`
-      : `echo.\necho ============================================================\necho   ${title}\necho ============================================================\necho Manual command: ${displayCommand}\necho.\n${command}\necho.\nif exist "${exitFlag}" exit /b 0\necho Process exited. Waiting for monitor shutdown...\npowershell -NoProfile -Command "try{$c=[IO.Pipes.NamedPipeClientStream]::new('.','${getExitPipeName(projectRoot)}','In');$c.Connect(60000);$c.ReadByte()|Out-Null;$c.Close()}catch{}"\nexit /b 0`;
-    const scriptContent = `@echo off\ntitle ${title}\ncd /d "${projectRoot}"\n${executionBlock}\n`;
+      ? `cls\necho.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\ncmd /k`
+      : `echo.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\n${command}\necho.\nif exist "${exitFlag}" exit /b 0\necho Process exited. Waiting for monitor shutdown...\npowershell -NoProfile -Command "try{$c=[IO.Pipes.NamedPipeClientStream]::new('.','${getExitPipeName(projectRoot)}','In');$c.Connect(60000);$c.ReadByte()|Out-Null;$c.Close()}catch{}"\nexit /b 0`;
+    const scriptContent = `@echo off\ntitle ${safeTitle}\ncd /d "${projectRoot}"\n${executionBlock}\n`;
     const tempFile = join(tempDir, `.temp-${id}.bat`);
     writeFileSync(tempFile, scriptContent);
     return tempFile;
   }
 
   const isInteractive = command === "bash";
+  const safeTitle = escapeBashDquote(title);
+  const safeManual = escapeBashDquote(displayCommand);
   const executionBlock = isInteractive
-    ? `clear\necho ""\necho "============================================================"\necho "  ${title}"\necho "============================================================"\necho "Manual command: ${displayCommand}"\necho ""\nexec bash`
-    : `echo ""\necho "============================================================"\necho "  ${title}"\necho "============================================================"\necho "Manual command: ${displayCommand}"\necho ""\n${command}\necho ""\nif [ -f "${exitFlag}" ]; then exit 0; fi\necho "Process exited. Waiting for monitor shutdown..."\nwhile true; do sleep 2; if [ -f "${exitFlag}" ]; then exit 0; fi; done`;
+    ? `clear\necho ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\nexec bash`
+    : `echo ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\n${command}\necho ""\nif [ -f "${exitFlag}" ]; then exit 0; fi\necho "Process exited. Waiting for monitor shutdown..."\nwhile true; do sleep 2; if [ -f "${exitFlag}" ]; then exit 0; fi; done`;
   const scriptContent = `#!/usr/bin/env bash\ncd "${projectRoot}"\n${executionBlock}\n`;
   const tempFile = join(tempDir, `.temp-${id}.sh`);
   writeFileSync(tempFile, scriptContent);
