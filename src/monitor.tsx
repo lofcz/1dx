@@ -895,10 +895,18 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
   const [showSpinner, setShowSpinner] = useState(false);
   const [spinnerMessage, setSpinnerMessage] = useState("");
   const [failed, setFailed] = useState(false);
+  // Run the startup sequence EXACTLY once. `onComplete` is a fresh closure on
+  // every App render, so an Ink re-render (e.g. the terminal resize that fires
+  // when we spawn tabs / restore focus) would otherwise re-fire this effect and
+  // re-spawn every still-"dead" service -- the runaway "keeps opening more
+  // tabs" bug. The ref makes it idempotent regardless of why the effect re-runs.
+  const startedRef = useRef(false);
 
   const addLog = (color: string, text: string) => setLogs((current) => [...current, { color, text }]);
 
   useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
     (async () => {
       ensureRuntimeDirs(projectRoot);
       try {
@@ -1486,16 +1494,20 @@ function ExitScreen({ projectRoot, config }: RuntimeOptions) {
 
 function App({ projectRoot, config }: RuntimeOptions) {
   const [mode, setMode] = useState<"startup" | "monitor" | "exiting">("startup");
+  // Stable callbacks. Passing a fresh closure re-fires child effects on every
+  // Ink re-render (resize, etc.), which for <Startup> means re-spawning services.
+  const enterMonitor = useCallback(() => setMode("monitor"), []);
+  const enterExiting = useCallback(() => setMode("exiting"), []);
 
   if (mode === "startup") {
-    return <Startup projectRoot={projectRoot} config={config} onComplete={() => setMode("monitor")} />;
+    return <Startup projectRoot={projectRoot} config={config} onComplete={enterMonitor} />;
   }
 
   if (mode === "exiting") {
     return <ExitScreen projectRoot={projectRoot} config={config} />;
   }
 
-  return <Monitor projectRoot={projectRoot} config={config} onExit={() => setMode("exiting")} />;
+  return <Monitor projectRoot={projectRoot} config={config} onExit={enterExiting} />;
 }
 
 export function startMonitor(projectRoot: string, config: OneDxConfig) {
