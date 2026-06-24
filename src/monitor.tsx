@@ -457,9 +457,19 @@ function hasWindowsTerminal() {
 
 const USE_WINDOWS_TERMINAL = hasWindowsTerminal();
 
+// wt in WindowsApps is an App Execution Alias; Bun 1.4 spawn(..., shell: false) cannot launch it directly.
+function spawnWt(args: string[], options?: { cwd?: string }) {
+  spawn("cmd", ["/c", "wt", ...args], {
+    detached: true,
+    stdio: "ignore",
+    shell: false,
+    cwd: options?.cwd,
+  }).unref();
+}
+
 function focusWtTab(index: number) {
   if (!IS_WIN || !USE_WINDOWS_TERMINAL) return;
-  spawn("wt", ["-w", "0", "ft", "-t", String(index)], { detached: true, stdio: "ignore", shell: false }).unref();
+  spawnWt(["-w", "0", "ft", "-t", String(index)]);
 }
 
 function findLinuxTerminal() {
@@ -578,7 +588,7 @@ function flushTerminalQueue(projectRoot: string, options?: { restoreFocus?: bool
       if (index > 0) args.push(";");
       args.push("nt", "--title", term.safeTitle, "-d", projectRoot, "cmd", term.shouldPersistShell ? "/k" : "/c", term.tempFile);
     });
-    spawn("wt", args, { detached: true, stdio: "ignore", shell: false, cwd: projectRoot }).unref();
+    spawnWt(args, { cwd: projectRoot });
     terminalQueue.length = 0;
 
     if (options?.restoreFocus) {
