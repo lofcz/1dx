@@ -48,6 +48,9 @@ const ServiceSchema = z.object({
   // same port.
   onPortInUse: z.enum(["ignore", "kill"]).optional(),
   cleanup: CleanupSchema.optional(),
+  // Close the spawned terminal tab/window once the start command exits.
+  // Use for one-shot bootstraps (e.g. `supabase start`) that detach from the shell.
+  closeTerminalOnFinish: z.boolean().optional(),
 });
 
 const ActionCommandSchema = z.object({
@@ -336,6 +339,7 @@ export function detectSciobotPreset(projectRoot: string): OneDxConfig {
       cleanup: {
         commandLineContains: backendCleanup,
       },
+      closeTerminalOnFinish: true,
     },
   ];
 

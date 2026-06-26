@@ -500,7 +500,14 @@ function escapeBashDquote(text: string) {
   return text.replace(/[\\"`$]/g, (char) => `\\${char}`);
 }
 
-function createTerminalScript(projectRoot: string, id: string, title: string, command: string, manualCommand?: string) {
+function createTerminalScript(
+  projectRoot: string,
+  id: string,
+  title: string,
+  command: string,
+  manualCommand?: string,
+  closeOnFinish = false,
+) {
   ensureRuntimeDirs(projectRoot);
   const displayCommand = manualCommand || command;
   const exitFlag = getExitFlagPath(projectRoot);
@@ -512,7 +519,9 @@ function createTerminalScript(projectRoot: string, id: string, title: string, co
     const safeManual = escapeBatchEcho(displayCommand);
     const executionBlock = isInteractive
       ? `cls\necho.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\ncmd /k`
-      : `echo.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\n${command}\necho.\nif exist "${exitFlag}" exit /b 0\necho Process exited. Waiting for monitor shutdown...\npowershell -NoProfile -Command "try{$c=[IO.Pipes.NamedPipeClientStream]::new('.','${getExitPipeName(projectRoot)}','In');$c.Connect(60000);$c.ReadByte()|Out-Null;$c.Close()}catch{}"\nexit /b 0`;
+      : closeOnFinish
+        ? `echo.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\n${command}\nexit /b 0`
+        : `echo.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\n${command}\necho.\nif exist "${exitFlag}" exit /b 0\necho Process exited. Waiting for monitor shutdown...\npowershell -NoProfile -Command "try{$c=[IO.Pipes.NamedPipeClientStream]::new('.','${getExitPipeName(projectRoot)}','In');$c.Connect(60000);$c.ReadByte()|Out-Null;$c.Close()}catch{}"\nexit /b 0`;
     const scriptContent = `@echo off\ntitle ${safeTitle}\ncd /d "${projectRoot}"\n${executionBlock}\n`;
     const tempFile = join(tempDir, `.temp-${id}.bat`);
     writeFileSync(tempFile, scriptContent);
@@ -524,7 +533,9 @@ function createTerminalScript(projectRoot: string, id: string, title: string, co
   const safeManual = escapeBashDquote(displayCommand);
   const executionBlock = isInteractive
     ? `clear\necho ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\nexec bash`
-    : `echo ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\n${command}\necho ""\nif [ -f "${exitFlag}" ]; then exit 0; fi\necho "Process exited. Waiting for monitor shutdown..."\nwhile true; do sleep 2; if [ -f "${exitFlag}" ]; then exit 0; fi; done`;
+    : closeOnFinish
+      ? `echo ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\n${command}\nexit 0`
+      : `echo ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\n${command}\necho ""\nif [ -f "${exitFlag}" ]; then exit 0; fi\necho "Process exited. Waiting for monitor shutdown..."\nwhile true; do sleep 2; if [ -f "${exitFlag}" ]; then exit 0; fi; done`;
   const scriptContent = `#!/usr/bin/env bash\ncd "${projectRoot}"\n${executionBlock}\n`;
   const tempFile = join(tempDir, `.temp-${id}.sh`);
   writeFileSync(tempFile, scriptContent);
@@ -534,8 +545,15 @@ function createTerminalScript(projectRoot: string, id: string, title: string, co
 
 const terminalQueue: SpawnedTab[] = [];
 
-function spawnTerminal(projectRoot: string, id: string, title: string, command: string, manualCommand?: string) {
-  const tempFile = createTerminalScript(projectRoot, id, title, command, manualCommand);
+function spawnTerminal(
+  projectRoot: string,
+  id: string,
+  title: string,
+  command: string,
+  manualCommand?: string,
+  closeOnFinish = false,
+) {
+  const tempFile = createTerminalScript(projectRoot, id, title, command, manualCommand, closeOnFinish);
   const safeTitle = id.charAt(0).toUpperCase() + id.slice(1);
   const shouldPersistShell = command === "cmd" || command === "powershell" || command === "bash";
 
@@ -1136,6 +1154,7 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
           service.title,
           startupCommand.command,
           startupCommand.manualCommand,
+          service.closeTerminalOnFinish ?? false,
         );
         addLog(service.color || "white", `Queued: ${service.title}`);
       }
@@ -1370,7 +1389,14 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         setMessage("Starting dead services...");
         for (const service of deadServices) {
           if (!service.start) continue;
-          spawnTerminal(projectRoot, service.id, service.title, service.start.shellCommand, service.start.manualCommand);
+          spawnTerminal(
+            projectRoot,
+            service.id,
+            service.title,
+            service.start.shellCommand,
+            service.start.manualCommand,
+            service.closeTerminalOnFinish ?? false,
+          );
         }
         flushTerminalQueue(projectRoot);
         setMessage(`✓ Started: ${deadServices.map((service) => service.id).join(", ")}`);
