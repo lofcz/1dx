@@ -949,23 +949,24 @@ function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
 }
 
 function restoreTerminalAndPrintExit(projectName: string) {
-  process.stdout.write("\x1b[?25h");
-  process.stdout.write("\x1b[?2026l");
   process.stdin.setRawMode?.(false);
-  process.stdout.write("\x1b[2J\x1b[H");
-  console.log(`\x1b[36m${projectName} Dev Monitor stopped.\x1b[0m\nTerminals and configured services have been closed.\n`);
+  writeMainTerminalStatusLine(`\x1b[36m${projectName} Dev Monitor stopped.\x1b[0m`);
+  process.stdout.write("Terminals and configured services have been closed.\n");
+}
+
+function resetMainTerminalView() {
+  // Reset scroll region, clear scrollback + screen, and park the cursor at row 1.
+  // Interactive external commands can leave the viewport scrolled; 2J alone does not fix that.
+  process.stdout.write("\x1b[?25h\x1b[?2026l\x1b[r\x1b[2J\x1b[3J\x1b[1;1H");
 }
 
 function clearMainTerminal() {
-  try {
-    if (IS_WIN) {
-      spawnSync("cmd", ["/c", "cls"], { stdio: "inherit" });
-    } else {
-      spawnSync("clear", [], { stdio: "inherit" });
-    }
-  } catch {
-    process.stdout.write("\x1b[2J\x1b[H");
-  }
+  resetMainTerminalView();
+}
+
+function writeMainTerminalStatusLine(text: string) {
+  resetMainTerminalView();
+  process.stdout.write(`\x1b[1;1H${text}\n`);
 }
 
 function resolveStartupCommand(service: OneDxService, running: boolean) {
@@ -1289,13 +1290,10 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
   }, []);
 
   const finishExternalCommand = useCallback((label: string, succeeded: boolean, errorText?: string) => {
-    clearMainTerminal();
-    if (succeeded) {
-      console.log(`\x1b[32m✓ ${label} completed.\x1b[0m`);
-    } else {
-      const detail = errorText ? `: ${errorText}` : "";
-      console.log(`\x1b[31m✗ ${label} failed${detail}.\x1b[0m`);
-    }
+    const message = succeeded
+      ? `\x1b[32m✓ ${label} completed.\x1b[0m`
+      : `\x1b[31m✗ ${label} failed${errorText ? `: ${errorText}` : ""}.\x1b[0m`;
+    writeMainTerminalStatusLine(message);
     setWaitingForKey(true);
     externalReturnTimerRef.current = setTimeout(() => {
       dismissWaitingState();
@@ -1323,7 +1321,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     }
 
     if (action.mode === "external" && action.command) {
-      process.stdout.write("\x1b[?25h\x1b[?2026l\x1b[2J\x1b[H");
+      resetMainTerminalView();
       try {
         const result = spawnSync(action.command, action.args || [], { cwd: projectRoot, stdio: "inherit", shell: true });
         if (result.error) {
