@@ -1204,6 +1204,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
   const refreshingRef = useRef(false);
   const activeCommandRef = useRef<ActiveCommand | null>(null);
   const statusesRef = useRef<Record<string, ServiceStatus>>({});
+  const externalReturnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [commandKey, setCommandKey] = useState(0);
 
   const managedServices = useMemo(
@@ -1271,6 +1272,44 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     }, delayMs);
   }, []);
 
+  const dismissWaitingState = useCallback(() => {
+    if (externalReturnTimerRef.current) {
+      clearTimeout(externalReturnTimerRef.current);
+      externalReturnTimerRef.current = null;
+    }
+    clearMainTerminal();
+    process.stdout.write("\x1b[?2026h\x1b[?25l");
+    activeCommandRef.current = null;
+    setActiveCommand(null);
+    setRecoveryPrompt(null);
+    setMessage(null);
+    setWaitingForKey(false);
+    setBusy(false);
+    busyRef.current = false;
+  }, []);
+
+  const finishExternalCommand = useCallback((label: string, succeeded: boolean, errorText?: string) => {
+    clearMainTerminal();
+    if (succeeded) {
+      console.log(`\x1b[32m✓ ${label} completed.\x1b[0m`);
+    } else {
+      const detail = errorText ? `: ${errorText}` : "";
+      console.log(`\x1b[31m✗ ${label} failed${detail}.\x1b[0m`);
+    }
+    setWaitingForKey(true);
+    externalReturnTimerRef.current = setTimeout(() => {
+      dismissWaitingState();
+    }, 1000);
+  }, [dismissWaitingState]);
+
+  useEffect(() => {
+    return () => {
+      if (externalReturnTimerRef.current) {
+        clearTimeout(externalReturnTimerRef.current);
+      }
+    };
+  }, []);
+
   const handleAction = useCallback(async (value: string) => {
     if (busyRef.current) return;
     busyRef.current = true;
@@ -1286,13 +1325,18 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     if (action.mode === "external" && action.command) {
       process.stdout.write("\x1b[?25h\x1b[?2026l\x1b[2J\x1b[H");
       try {
-        spawnSync(action.command, action.args || [], { cwd: projectRoot, stdio: "inherit", shell: true });
-        console.log(`\n\x1b[32m✓ ${action.label} completed. Press any key to return...\x1b[0m`);
+        const result = spawnSync(action.command, action.args || [], { cwd: projectRoot, stdio: "inherit", shell: true });
+        if (result.error) {
+          finishExternalCommand(action.label, false, result.error.message);
+        } else if (result.status !== 0) {
+          finishExternalCommand(action.label, false, `exit code ${result.status ?? "unknown"}`);
+        } else {
+          finishExternalCommand(action.label, true);
+        }
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error);
-        console.log(`\n\x1b[31m✗ ${action.label} failed: ${text}. Press any key to return...\x1b[0m`);
+        finishExternalCommand(action.label, false, text);
       }
-      setWaitingForKey(true);
       return;
     }
 
@@ -1407,7 +1451,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         setBusy(false);
         busyRef.current = false;
     }
-  }, [deadServices, dismissTransientMessage, managedServices, menuItems, onExit, projectRoot, refreshStatuses]);
+  }, [deadServices, dismissTransientMessage, finishExternalCommand, managedServices, menuItems, onExit, projectRoot, refreshStatuses]);
 
   const retryRecovery = useCallback(() => {
     if (!recoveryPrompt) return;
@@ -1476,17 +1520,6 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     setRecoveryPrompt(null);
     setMessage("Command failed - press any key to continue");
     setWaitingForKey(true);
-  }, []);
-
-  const dismissWaitingState = useCallback(() => {
-    process.stdout.write("\x1b[?2026h\x1b[?25l");
-    activeCommandRef.current = null;
-    setActiveCommand(null);
-    setRecoveryPrompt(null);
-    setMessage(null);
-    setWaitingForKey(false);
-    setBusy(false);
-    busyRef.current = false;
   }, []);
 
   useInput(

@@ -474,6 +474,14 @@ export function detectSciobotPreset(projectRoot: string): OneDxConfig {
       args: ["update"],
     },
     {
+      id: "update-deps-interactive",
+      label: "Update deps (interactive)",
+      shortcut: "u",
+      mode: "external",
+      command: "bun",
+      args: ["update", "-i"],
+    },
+    {
       id: "frontend",
       label: "Open frontend in browser",
       shortcut: "f",
@@ -602,6 +610,14 @@ export function detectGenericPreset(projectRoot: string): OneDxConfig {
               mode: "inline",
               command: "bun",
               args: ["update"],
+            } satisfies OneDxAction,
+            {
+              id: "update-deps-interactive",
+              label: "Update deps (interactive)",
+              shortcut: "u",
+              mode: "external",
+              command: "bun",
+              args: ["update", "-i"],
             } satisfies OneDxAction,
             {
               id: "frontend",
