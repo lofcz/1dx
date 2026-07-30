@@ -5,6 +5,7 @@ import process from "node:process";
 const DEFAULT_LIMIT = 1000;
 const ALLOWED_OUTPUTS = new Set(["json", "table", "csv"]);
 const SUPABASE_VALUE_FLAGS = new Set([
+  "--agent",
   "--db-url",
   "--dns-resolver",
   "--network-id",
@@ -210,18 +211,84 @@ const writeOutputAndExit = (stdout: string, stderr: string, exitCode: number) =>
   process.exit(exitCode);
 };
 
-const extractJsonPayload = (stdout: string) => {
-  const jsonStart = stdout.indexOf("{");
-  if (jsonStart < 0) {
-    throw new Error("Supabase CLI did not return JSON output.");
+const findJsonStartIndexes = (stdout: string) => {
+  const starts = [stdout.indexOf("["), stdout.indexOf("{")].filter(
+    (index) => index >= 0,
+  );
+  starts.sort((left, right) => left - right);
+  return starts;
+};
+
+const rowsFromParsedJson = (parsed: unknown): unknown[] | null => {
+  if (Array.isArray(parsed)) {
+    return parsed;
   }
 
-  const parsed = JSON.parse(stdout.slice(jsonStart)) as JsonQueryPayload;
-  if (!Array.isArray(parsed.rows)) {
-    throw new Error("Supabase CLI JSON output did not include a rows array.");
+  if (
+    parsed != null &&
+    typeof parsed === "object" &&
+    Array.isArray((parsed as JsonQueryPayload).rows)
+  ) {
+    return (parsed as JsonQueryPayload).rows as unknown[];
   }
 
-  return parsed.rows;
+  return null;
+};
+
+/**
+ * Pull row data out of Supabase CLI stdout.
+ * Returns `null` when the CLI printed a non-JSON command tag (CREATE TABLE, etc.).
+ */
+const extractJsonPayload = (stdout: string): unknown[] | null => {
+  const starts = findJsonStartIndexes(stdout);
+  if (starts.length === 0) {
+    return null;
+  }
+
+  const parseErrors: string[] = [];
+
+  for (const jsonStart of starts) {
+    try {
+      const parsed: unknown = JSON.parse(stdout.slice(jsonStart));
+      const rows = rowsFromParsedJson(parsed);
+      if (rows) {
+        return rows;
+      }
+      parseErrors.push(
+        "JSON value was not a rows array or an object with a rows array.",
+      );
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      parseErrors.push(text);
+    }
+  }
+
+  const detail = parseErrors[parseErrors.length - 1] ?? "unknown parse error";
+  throw new Error(
+    `Supabase CLI returned output that could not be parsed as query JSON (${detail}).`,
+  );
+};
+
+const formatCliOutputError = (
+  message: string,
+  stdout: string,
+  stderr: string,
+) => {
+  const chunks = [message];
+  const trimmedStdout = stdout.trim();
+  const trimmedStderr = stderr.trim();
+
+  if (trimmedStdout) {
+    chunks.push("", "--- stdout ---", trimmedStdout);
+  }
+  if (trimmedStderr) {
+    chunks.push("", "--- stderr ---", trimmedStderr);
+  }
+  if (!trimmedStdout && !trimmedStderr) {
+    chunks.push("", "(Supabase CLI produced no stdout or stderr.)");
+  }
+
+  return `${chunks.join("\n")}\n`;
 };
 
 const printJsonResult = (rows: unknown[], limit: number, offset: number) => {
@@ -267,7 +334,7 @@ export function printSqlHelp() {
 \x1b[33mBehavior:\x1b[0m
   JSON output always returns rows plus a count of matched rows in the current response.
   When a JSON query has more than the page limit, 1dx also returns pagination metadata.
-  Table and CSV output are passed through from the Supabase CLI unchanged.
+  Non-row statements (DDL/DML command tags) and table/CSV output are passed through unchanged.
 
 \x1b[33mSupabase flags:\x1b[0m
   Pass through flags like --linked, --local, --db-url, --profile, or --workdir.
@@ -319,11 +386,19 @@ export function runSqlCommand(rawArgs: string[]) {
   }
 
   try {
-    const rows = extractJsonPayload(result.stdout);
+    const rows = extractJsonPayload(result.stdout ?? "");
+    if (rows == null) {
+      // DDL/DML often returns a Postgres command tag (e.g. "CREATE TABLE") with
+      // exit 0 and no JSON. Pass that through instead of inventing an error.
+      writeOutputAndExit(result.stdout ?? "", result.stderr ?? "", 0);
+    }
+
     printJsonResult(rows, parsed.limit, parsed.offset);
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`${text}\n`);
+    process.stderr.write(
+      formatCliOutputError(text, result.stdout ?? "", result.stderr ?? ""),
+    );
     process.exit(1);
   }
 }
