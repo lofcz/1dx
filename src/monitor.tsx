@@ -726,17 +726,70 @@ function getProcessOnPort(port: number) {
   }
 }
 
+// Cached Win32_Process snapshot for Windows command-line matching. Refreshed
+// at most once per poll tick so N process-health checks don't spawn N
+// PowerShell processes (powershell cold-start is ~200-500ms).
+type WinProcessRow = { pid: string; image: string; cmd: string };
+let winProcessSnapshot: { at: number; rows: WinProcessRow[] } | null = null;
+
+function getWindowsProcessSnapshot(): WinProcessRow[] {
+  const now = Date.now();
+  if (winProcessSnapshot && now - winProcessSnapshot.at < 900) {
+    return winProcessSnapshot.rows;
+  }
+
+  // PID\0ImageName\0CommandLine per line — null-separated fields avoid CSV
+  // quoting headaches with arbitrary command lines.
+  const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+Get-CimInstance Win32_Process | ForEach-Object {
+  $img = if ($_.Name) { $_.Name } else { '' }
+  $cmd = if ($_.CommandLine) { $_.CommandLine } else { '' }
+  Write-Output (($_.ProcessId.ToString()) + [char]0 + $img + [char]0 + $cmd)
+}
+`;
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const output = execSync(`powershell -NoProfile -EncodedCommand ${encoded}`, {
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 8000,
+  });
+
+  const self = String(process.pid);
+  const rows: WinProcessRow[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    if (!line) continue;
+    const parts = line.split("\0");
+    if (parts.length < 2) continue;
+    const pid = parts[0] || "";
+    if (!pid || pid === self) continue;
+    rows.push({ pid, image: parts[1] || "", cmd: parts[2] || "" });
+  }
+
+  winProcessSnapshot = { at: now, rows };
+  return rows;
+}
+
 function getProcessByName(name: string) {
   try {
     if (IS_WIN) {
-      const output = execSync(`tasklist /FI "IMAGENAME eq ${name}*" /FO CSV /NH`, {
-        encoding: "utf8",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      const lines = output.trim().split("\n").filter((line) => line.toLowerCase().includes(name.toLowerCase()));
-      if (lines.length > 0) {
-        const match = lines[0].match(/"[^"]+","(\d+)"/);
-        if (match) return { running: true, pid: match[1] };
+      // Prefer image-name match (fast path for real .exe names), then fall
+      // back to CommandLine substring match — mirrors Unix `pgrep -f`.
+      // Tools launched via bunx/npx run as bun.exe/bunx.exe/node.exe with the
+      // package name only in CommandLine (e.g. `bunx.exe --bun typesafe-i18n`),
+      // so image-name alone always reported them as STOPPED while running.
+      const needle = name.toLowerCase();
+      const rows = getWindowsProcessSnapshot();
+      for (const row of rows) {
+        if (row.image.toLowerCase().startsWith(needle)) {
+          return { running: true, pid: row.pid };
+        }
+      }
+      for (const row of rows) {
+        if (row.cmd.toLowerCase().includes(needle)) {
+          return { running: true, pid: row.pid };
+        }
       }
       return { running: false, pid: null };
     }
