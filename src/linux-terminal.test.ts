@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildKonsoleLayoutFile,
   buildKonsoleTabsFile,
+  konsoleExecCommand,
   linuxBatchLaunchArgs,
   linuxLaunchArgs,
+  quoteForShell,
+  resolveKonsoleDbusTarget,
   shouldRunCloseOnFinishInline,
   terminalSupportsBatchTabs,
 } from "./linux-terminal.ts";
@@ -77,6 +81,35 @@ describe("linuxBatchLaunchArgs", () => {
   test("konsole and gnome-terminal support batch tabs", () => {
     expect(terminalSupportsBatchTabs("konsole")).toBe(true);
     expect(terminalSupportsBatchTabs("xterm")).toBe(false);
+  });
+});
+
+describe("konsole attach helpers", () => {
+  test("layout JSON is a single-tab splitter with Command + cwd", () => {
+    const json = JSON.parse(buildKonsoleLayoutFile("exec '/tmp/edge.sh'", "/repo"));
+    expect(json.Orientation).toBe("Horizontal");
+    expect(json.Widgets).toEqual([
+      {
+        SessionRestoreId: 0,
+        Command: "exec '/tmp/edge.sh'",
+        WorkingDirectory: "/repo",
+      },
+    ]);
+  });
+
+  test("exec command quotes spaces and apostrophes", () => {
+    expect(konsoleExecCommand("/tmp/ok.sh")).toBe("exec '/tmp/ok.sh'");
+    expect(konsoleExecCommand("/tmp/it's.sh")).toBe("exec '/tmp/it'\\''s.sh'");
+    expect(quoteForShell("a b")).toBe("'a b'");
+  });
+
+  test("prefers KONSOLE_DBUS_* from the current session", () => {
+    expect(
+      resolveKonsoleDbusTarget({
+        KONSOLE_DBUS_SERVICE: "org.kde.konsole-123",
+        KONSOLE_DBUS_WINDOW: "2",
+      }),
+    ).toEqual({ service: "org.kde.konsole-123", windowPath: "/Windows/2" });
   });
 });
 

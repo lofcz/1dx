@@ -18,6 +18,7 @@ import {
   linuxLaunchArgs,
   shouldRunCloseOnFinishInline,
   terminalSupportsBatchTabs,
+  tryAttachKonsoleTabs,
 } from "./linux-terminal.ts";
 
 const IS_WIN = platform() === "win32";
@@ -515,6 +516,13 @@ function flushLinuxTerminalQueue(projectRoot: string) {
       spawn("bash", [tab.tempFile], { detached: true, stdio: "ignore", cwd: projectRoot }).unref();
     }
     return;
+  }
+
+  if (terminal === "konsole") {
+    const layoutFile = join(getProjectTempDir(projectRoot), ".temp-konsole-layout.json");
+    if (tryAttachKonsoleTabs(tabs, projectRoot, layoutFile, writeFileSync, { restoreFocus: true })) {
+      return;
+    }
   }
 
   if (terminalSupportsBatchTabs(terminal)) {
