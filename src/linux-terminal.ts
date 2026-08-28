@@ -146,7 +146,55 @@ export function buildKonsoleLayoutFile(command: string, workdir: string) {
 export type KonsoleDbusTarget = {
   service: string;
   windowPath: string;
+  dbusAddress?: string;
 };
+
+export type AttachKonsoleResult =
+  | { ok: true }
+  | { ok: false; reason: string };
+
+export function parseEnvironBuffer(buf: Buffer | string) {
+  const text = typeof buf === "string" ? buf : buf.toString("utf8");
+  const out: Record<string, string> = {};
+  for (const part of text.split("\0")) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) continue;
+    out[part.slice(0, eq)] = part.slice(eq + 1);
+  }
+  return out;
+}
+
+export function collectKonsoleHints(
+  env: NodeJS.ProcessEnv,
+  ancestorEnvs: Array<Record<string, string>> = [],
+) {
+  let service: string | undefined;
+  let window: string | undefined;
+  let dbusAddress: string | undefined;
+  for (const src of [env as Record<string, string | undefined>, ...ancestorEnvs]) {
+    if (!service && src.KONSOLE_DBUS_SERVICE) service = src.KONSOLE_DBUS_SERVICE;
+    if (!window && src.KONSOLE_DBUS_WINDOW) window = src.KONSOLE_DBUS_WINDOW;
+    if (!dbusAddress && src.DBUS_SESSION_BUS_ADDRESS) dbusAddress = src.DBUS_SESSION_BUS_ADDRESS;
+  }
+  return { service, window, dbusAddress };
+}
+
+export function readAncestorEnvirons(startPid = process.pid) {
+  const envs: Array<Record<string, string>> = [];
+  let pid = startPid;
+  for (let i = 0; i < 24; i++) {
+    if (!pid || pid <= 1) break;
+    try {
+      envs.push(parseEnvironBuffer(readFileSync(`/proc/${pid}/environ`)));
+    } catch {
+      // process exited or environ is unreadable
+    }
+    const status = readProcStatus(pid);
+    if (!status) break;
+    pid = status.ppid;
+  }
+  return envs;
+}
 
 function commandExists(bin: string) {
   try {
@@ -176,7 +224,7 @@ function readProcStatus(pid: number) {
   }
 }
 
-export function findKonsoleAncestorPid(startPid = process.ppid) {
+export function findKonsoleAncestorPid(startPid = process.pid) {
   let pid = startPid;
   for (let i = 0; i < 24; i++) {
     if (!pid || pid <= 1) return null;
@@ -190,22 +238,33 @@ export function findKonsoleAncestorPid(startPid = process.ppid) {
 
 export function resolveKonsoleDbusTarget(
   env: NodeJS.ProcessEnv = process.env,
+  ancestorEnvs: Array<Record<string, string>> = readAncestorEnvirons(),
 ): KonsoleDbusTarget | null {
-  const service = env.KONSOLE_DBUS_SERVICE;
-  const window = env.KONSOLE_DBUS_WINDOW;
-  if (service && window) {
-    return { service, windowPath: `/Windows/${window}` };
+  const hints = collectKonsoleHints(env, ancestorEnvs);
+  if (hints.service && hints.window) {
+    return {
+      service: hints.service,
+      windowPath: `/Windows/${hints.window}`,
+      dbusAddress: hints.dbusAddress,
+    };
   }
 
   const pid = findKonsoleAncestorPid();
   if (pid === null) return null;
-  return { service: `org.kde.konsole-${pid}`, windowPath: "/Windows/1" };
+  return {
+    service: `org.kde.konsole-${pid}`,
+    windowPath: "/Windows/1",
+    dbusAddress: hints.dbusAddress,
+  };
 }
 
-function qdbusCall(qdbus: string, args: string[]) {
+function qdbusCall(qdbus: string, args: string[], dbusAddress?: string) {
   return execFileSync(qdbus, args, {
     encoding: "utf8",
     stdio: ["pipe", "pipe", "pipe"],
+    env: dbusAddress
+      ? { ...process.env, DBUS_SESSION_BUS_ADDRESS: dbusAddress }
+      : process.env,
   }).trim();
 }
 
@@ -221,42 +280,46 @@ export function tryAttachKonsoleTabs(
   workdir: string,
   layoutFile: string,
   writeFile: (path: string, contents: string) => void,
-  options?: { restoreFocus?: boolean; env?: NodeJS.ProcessEnv },
-) {
-  const target = resolveKonsoleDbusTarget(options?.env);
-  if (!target) return false;
+  options?: { restoreFocus?: boolean; env?: NodeJS.ProcessEnv; target?: KonsoleDbusTarget },
+): AttachKonsoleResult {
+  const target = options?.target ?? resolveKonsoleDbusTarget(options?.env);
+  if (!target) return { ok: false, reason: "no Konsole DBus target in this process tree" };
 
   const qdbus = findQdbus();
-  if (!qdbus) return false;
+  if (!qdbus) return { ok: false, reason: "qdbus not found" };
+
+  const call = (args: string[]) => qdbusCall(qdbus, args, target.dbusAddress);
 
   let original = "";
   let known: number[];
   try {
-    original = qdbusCall(qdbus, [target.service, target.windowPath, "org.kde.konsole.Window.currentSession"]);
+    original = call([target.service, target.windowPath, "org.kde.konsole.Window.currentSession"]);
     known = parseSessionList(
-      qdbusCall(qdbus, [target.service, target.windowPath, "org.kde.konsole.Window.sessionList"]),
+      call([target.service, target.windowPath, "org.kde.konsole.Window.sessionList"]),
     );
-  } catch {
-    return false;
+  } catch (error) {
+    return { ok: false, reason: `cannot talk to ${target.service}: ${error instanceof Error ? error.message : error}` };
   }
 
   const knownSet = new Set(known);
   let created = 0;
+  let lastError = "";
 
   for (const tab of tabs) {
     writeFile(layoutFile, buildKonsoleLayoutFile(konsoleExecCommand(tab.tempFile), workdir));
     try {
-      qdbusCall(qdbus, [target.service, target.windowPath, "org.kde.konsole.Window.loadLayout", layoutFile]);
-    } catch {
+      call([target.service, target.windowPath, "org.kde.konsole.Window.loadLayout", layoutFile]);
+    } catch (error) {
+      lastError = `loadLayout failed: ${error instanceof Error ? error.message : error}`;
       break;
     }
 
-    const deadline = Date.now() + 1500;
+    const deadline = Date.now() + 2000;
     let added: number[] = [];
     while (Date.now() < deadline) {
       try {
         const now = parseSessionList(
-          qdbusCall(qdbus, [target.service, target.windowPath, "org.kde.konsole.Window.sessionList"]),
+          call([target.service, target.windowPath, "org.kde.konsole.Window.sessionList"]),
         );
         added = now.filter((id) => !knownSet.has(id));
         if (added.length > 0) break;
@@ -266,12 +329,15 @@ export function tryAttachKonsoleTabs(
       Bun.sleepSync(40);
     }
 
-    if (added.length === 0) break;
+    if (added.length === 0) {
+      lastError = "loadLayout returned but no new session appeared";
+      break;
+    }
     for (const id of added) {
       knownSet.add(id);
       try {
-        qdbusCall(qdbus, [target.service, `/Sessions/${id}`, "org.kde.konsole.Session.setTabTitleFormat", "0", tab.title]);
-        qdbusCall(qdbus, [target.service, `/Sessions/${id}`, "org.kde.konsole.Session.setTitle", "0", tab.title]);
+        call([target.service, `/Sessions/${id}`, "org.kde.konsole.Session.setTabTitleFormat", "0", tab.title]);
+        call([target.service, `/Sessions/${id}`, "org.kde.konsole.Session.setTitle", "0", tab.title]);
       } catch {
         // Title is cosmetic; the tab still launched.
       }
@@ -279,15 +345,18 @@ export function tryAttachKonsoleTabs(
     created += 1;
   }
 
-  if (created === 0) return false;
+  if (created === 0) return { ok: false, reason: lastError || "no tabs created" };
 
   if (options?.restoreFocus !== false && original) {
     try {
-      qdbusCall(qdbus, [target.service, target.windowPath, "org.kde.konsole.Window.setCurrentSession", original]);
+      call([target.service, target.windowPath, "org.kde.konsole.Window.setCurrentSession", original]);
     } catch {
       // Tabs were created even if we cannot hop back to the dashboard.
     }
   }
 
-  return created === tabs.length;
+  if (created !== tabs.length) {
+    return { ok: false, reason: `only attached ${created}/${tabs.length} tab(s)${lastError ? `: ${lastError}` : ""}` };
+  }
+  return { ok: true };
 }

@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { render, Box, Text, useApp, useInput, useWindowSize } from "ink";
 import stream from "stream";
 import net from "net";
-import { arch, platform } from "os";
+import { arch, platform, tmpdir } from "os";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { execSync, spawn, spawnSync } from "child_process";
@@ -16,6 +16,7 @@ import {
   buildKonsoleTabsFile,
   linuxBatchLaunchArgs,
   linuxLaunchArgs,
+  resolveKonsoleDbusTarget,
   shouldRunCloseOnFinishInline,
   terminalSupportsBatchTabs,
   tryAttachKonsoleTabs,
@@ -483,7 +484,7 @@ function focusWtTab(index: number) {
 }
 
 function findLinuxTerminal() {
-  const preferred = process.env.KONSOLE_VERSION || process.env.KONSOLE_DBUS_SERVICE
+  const preferred = resolveKonsoleDbusTarget() || process.env.KONSOLE_VERSION
     ? "konsole"
     : process.env.GNOME_TERMINAL_SERVICE || process.env.GNOME_TERMINAL_SCREEN
       ? "gnome-terminal"
@@ -503,25 +504,32 @@ function findLinuxTerminal() {
   return null;
 }
 
-function flushLinuxTerminalQueue(projectRoot: string) {
+function flushLinuxTerminalQueue(projectRoot: string): string | null {
   const tabs = terminalQueue.splice(0).map((tab) => ({
     title: tab.title ?? tab.safeTitle,
     tempFile: tab.tempFile,
   }));
-  if (tabs.length === 0) return;
+  if (tabs.length === 0) return null;
 
   const terminal = findLinuxTerminal();
   if (!terminal) {
     for (const tab of tabs) {
       spawn("bash", [tab.tempFile], { detached: true, stdio: "ignore", cwd: projectRoot }).unref();
     }
-    return;
+    return null;
   }
 
   if (terminal === "konsole") {
-    const layoutFile = join(getProjectTempDir(projectRoot), ".temp-konsole-layout.json");
-    if (tryAttachKonsoleTabs(tabs, projectRoot, layoutFile, writeFileSync, { restoreFocus: true })) {
-      return;
+    const target = resolveKonsoleDbusTarget();
+    if (target) {
+      const layoutFile = join(tmpdir(), `1dx-konsole-layout-${process.pid}.json`);
+      const result = tryAttachKonsoleTabs(tabs, projectRoot, layoutFile, writeFileSync, {
+        restoreFocus: true,
+        target,
+      });
+      if (result.ok) return `Attached ${tabs.length} tab(s) to this Konsole`;
+      // Do not open a second window when we already found this Konsole.
+      return `Could not attach tabs to this Konsole (${result.ok === false ? result.reason : "unknown error"})`;
     }
   }
 
@@ -534,7 +542,7 @@ function flushLinuxTerminalQueue(projectRoot: string) {
       stdio: "ignore",
       cwd: projectRoot,
     }).unref();
-    return;
+    return `Opened a new ${terminal} window with ${tabs.length} tab(s)`;
   }
 
   for (const tab of tabs) {
@@ -545,6 +553,7 @@ function flushLinuxTerminalQueue(projectRoot: string) {
       cwd: projectRoot,
     }).unref();
   }
+  return null;
 }
 
 // cmd.exe treats & | < > ^ as command operators even inside an `echo` argument.
@@ -646,8 +655,8 @@ function spawnTerminal(
   spawn("bash", [tempFile], { detached: true, stdio: "ignore", cwd: projectRoot }).unref();
 }
 
-function flushTerminalQueue(projectRoot: string, options?: { restoreFocus?: boolean }) {
-  if (terminalQueue.length === 0) return;
+function flushTerminalQueue(projectRoot: string, options?: { restoreFocus?: boolean }): string | null {
+  if (terminalQueue.length === 0) return null;
 
   if (IS_WIN && USE_WINDOWS_TERMINAL) {
     const args = ["-w", "0"];
@@ -661,7 +670,7 @@ function flushTerminalQueue(projectRoot: string, options?: { restoreFocus?: bool
     if (options?.restoreFocus) {
       setTimeout(() => focusWtTab(0), 500);
     }
-    return;
+    return null;
   }
 
   if (IS_MAC) {
@@ -690,15 +699,15 @@ function flushTerminalQueue(projectRoot: string, options?: { restoreFocus?: bool
       }
     }
     terminalQueue.length = 0;
-    return;
+    return null;
   }
 
   if (IS_LINUX) {
-    flushLinuxTerminalQueue(projectRoot);
-    return;
+    return flushLinuxTerminalQueue(projectRoot);
   }
 
   terminalQueue.length = 0;
+  return null;
 }
 
 function isPortInUse(port: number) {
@@ -1341,7 +1350,8 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
         addLog(service.color || "white", `Queued: ${service.title}`);
       }
 
-      flushTerminalQueue(projectRoot, { restoreFocus: true });
+      const spawnResult = flushTerminalQueue(projectRoot, { restoreFocus: true });
+      if (spawnResult) addLog(spawnResult.startsWith("Attached") ? "green" : "yellow", spawnResult);
       addLog("cyan", "Spawned all terminals");
 
       if (config.startup?.autoOpenFrontend && config.project.frontendUrl) {

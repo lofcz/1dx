@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   buildKonsoleLayoutFile,
   buildKonsoleTabsFile,
+  collectKonsoleHints,
   konsoleExecCommand,
   linuxBatchLaunchArgs,
   linuxLaunchArgs,
+  parseEnvironBuffer,
   quoteForShell,
   resolveKonsoleDbusTarget,
   shouldRunCloseOnFinishInline,
@@ -108,8 +110,20 @@ describe("konsole attach helpers", () => {
       resolveKonsoleDbusTarget({
         KONSOLE_DBUS_SERVICE: "org.kde.konsole-123",
         KONSOLE_DBUS_WINDOW: "2",
-      }),
+      }, []),
     ).toEqual({ service: "org.kde.konsole-123", windowPath: "/Windows/2" });
+  });
+
+  test("reads Konsole DBus hints from ancestor environ", () => {
+    const parsed = parseEnvironBuffer("KONSOLE_DBUS_SERVICE=:1.9\0KONSOLE_DBUS_WINDOW=1\0DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/bus\0");
+    expect(parsed.KONSOLE_DBUS_SERVICE).toBe(":1.9");
+    expect(
+      collectKonsoleHints({}, [parsed]),
+    ).toEqual({
+      service: ":1.9",
+      window: "1",
+      dbusAddress: "unix:path=/tmp/bus",
+    });
   });
 });
 
