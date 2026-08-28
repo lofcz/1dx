@@ -164,6 +164,14 @@ export function parseEnvironBuffer(buf: Buffer | string) {
   return out;
 }
 
+/** Konsole sets KONSOLE_DBUS_WINDOW to `/Windows/1`, not `1`. */
+export function konsoleWindowPath(window: string) {
+  const trimmed = window.trim();
+  if (!trimmed) return "/Windows/1";
+  if (trimmed.startsWith("/")) return trimmed.replace(/\/{2,}/g, "/");
+  return `/Windows/${trimmed}`;
+}
+
 export function collectKonsoleHints(
   env: NodeJS.ProcessEnv,
   ancestorEnvs: Array<Record<string, string>> = [],
@@ -244,7 +252,7 @@ export function resolveKonsoleDbusTarget(
   if (hints.service && hints.window) {
     return {
       service: hints.service,
-      windowPath: `/Windows/${hints.window}`,
+      windowPath: konsoleWindowPath(hints.window),
       dbusAddress: hints.dbusAddress,
     };
   }

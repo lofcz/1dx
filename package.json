@@ -33,6 +33,7 @@
     "check": "bun src/cli.ts --help",
     "typecheck": "bunx tsc --noEmit",
     "test": "bun test",
+    "test:e2e-konsole": "bun scripts/e2e-konsole-attach.ts",
     "playground": "cd playground && bun ../src/cli.ts start",
     "prepublishOnly": "bun run typecheck && bun run check && bun test"
   },

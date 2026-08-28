@@ -3,6 +3,7 @@ import {
   buildKonsoleLayoutFile,
   buildKonsoleTabsFile,
   collectKonsoleHints,
+  konsoleWindowPath,
   konsoleExecCommand,
   linuxBatchLaunchArgs,
   linuxLaunchArgs,
@@ -112,6 +113,18 @@ describe("konsole attach helpers", () => {
         KONSOLE_DBUS_WINDOW: "2",
       }, []),
     ).toEqual({ service: "org.kde.konsole-123", windowPath: "/Windows/2" });
+  });
+
+  test("does not double-prefix Konsole's real /Windows/1 value", () => {
+    expect(konsoleWindowPath("/Windows/1")).toBe("/Windows/1");
+    expect(konsoleWindowPath("1")).toBe("/Windows/1");
+    expect(konsoleWindowPath("/Windows//1")).toBe("/Windows/1");
+    expect(
+      resolveKonsoleDbusTarget({
+        KONSOLE_DBUS_SERVICE: ":1.998",
+        KONSOLE_DBUS_WINDOW: "/Windows/1",
+      }, []),
+    ).toEqual({ service: ":1.998", windowPath: "/Windows/1" });
   });
 
   test("reads Konsole DBus hints from ancestor environ", () => {

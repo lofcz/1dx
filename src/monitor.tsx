@@ -528,8 +528,7 @@ function flushLinuxTerminalQueue(projectRoot: string): string | null {
         target,
       });
       if (result.ok) return `Attached ${tabs.length} tab(s) to this Konsole`;
-      // Do not open a second window when we already found this Konsole.
-      return `Could not attach tabs to this Konsole (${result.ok === false ? result.reason : "unknown error"})`;
+      // Services must still start. Fall through to a new window if attach fails.
     }
   }
 
