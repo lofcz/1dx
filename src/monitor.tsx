@@ -10,6 +10,7 @@ import { join } from "path";
 import { execSync, spawn, spawnSync } from "child_process";
 import { killPortProcess } from "kill-port-process";
 import type { OneDxAction, OneDxConfig, OneDxService } from "./config.ts";
+import { resolveServiceStartCommand } from "./shell-command.ts";
 
 const IS_WIN = platform() === "win32";
 const IS_MAC = platform() === "darwin";
@@ -1056,7 +1057,7 @@ function resolveStartupCommand(service: OneDxService, running: boolean) {
   }
 
   return {
-    command: service.start.shellCommand,
+    command: resolveServiceStartCommand(service.start, IS_WIN),
     manualCommand: service.start.manualCommand,
   };
 }
@@ -1446,7 +1447,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
             projectRoot,
             service.id,
             service.title,
-            service.start.shellCommand,
+            resolveServiceStartCommand(service.start, IS_WIN),
             service.start.manualCommand,
             service.closeTerminalOnFinish ?? false,
           );

@@ -2,6 +2,12 @@ import { existsSync, readFileSync } from "fs";
 import { basename, dirname, join } from "path";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
+import {
+  supabaseStartRetryUnix,
+  supabaseStartRetryWindows,
+  withPortEnvUnix,
+  withPortEnvWindows,
+} from "./shell-command.ts";
 
 const VariableValueSchema = z.union([z.string(), z.number(), z.boolean()]);
 const VariablesSchema = z.record(z.string(), VariableValueSchema);
@@ -24,6 +30,8 @@ const HealthSchema = z.discriminatedUnion("type", [
 
 const StartSchema = z.object({
   shellCommand: z.string().min(1),
+  // Bash/zsh form. On Unix, 1dx prefers this over translating `shellCommand`.
+  unixShellCommand: z.string().min(1).optional(),
   manualCommand: z.string().optional(),
 });
 
@@ -317,22 +325,8 @@ export function detectSciobotPreset(projectRoot: string): OneDxConfig {
       ambient: false,
       health: { type: "port", port: supabaseApiPortRef as any },
       start: {
-        shellCommand: [
-          "set RETRY_COUNT=0",
-          ":supabase_start_retry",
-          "set /a RETRY_COUNT+=1",
-          "if %RETRY_COUNT% gtr 10 (",
-          "  echo Supabase start failed after 10 attempts. Exiting.",
-          "  exit /b 1",
-          ")",
-          "bun run supabase:start",
-          "if %errorlevel% neq 0 (",
-          "  echo Retrying in 5 seconds... ^(attempt %RETRY_COUNT% of 10^)",
-          "  timeout /t 5 /nobreak >nul",
-          "  goto supabase_start_retry",
-          ")",
-          backendShellSuffix,
-        ].join("\n"),
+        shellCommand: supabaseStartRetryWindows(backendShellSuffix),
+        unixShellCommand: supabaseStartRetryUnix(backendShellSuffix),
         manualCommand: backendManualCommand,
       },
       startPolicy: "always-on-startup",
@@ -351,10 +345,8 @@ export function detectSciobotPreset(projectRoot: string): OneDxConfig {
       ambient: false,
       health: { type: "port", port: edgePortRef as any },
       start: {
-        shellCommand: [
-          `set PORT=${edgePortRef}`,
-          "bun run edge:serve",
-        ].join("\n"),
+        shellCommand: withPortEnvWindows(edgePortRef, "bun run edge:serve"),
+        unixShellCommand: withPortEnvUnix(edgePortRef, "bun run edge:serve"),
       },
       startPolicy: "if-dead",
       cleanup: {

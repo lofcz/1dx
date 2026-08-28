@@ -22,6 +22,7 @@
       "health": { "type": "port", "port": "${apiPort}" },
       "start": {
         "shellCommand": "set PORT=${apiPort} && bun run mock-server.ts",
+        "unixShellCommand": "PORT=${apiPort} bun run mock-server.ts",
         "manualCommand": "PORT=${apiPort} bun run mock-server.ts"
       },
       "startPolicy": "if-dead",
@@ -37,6 +38,7 @@
       "health": { "type": "port", "port": "${workerPort}" },
       "start": {
         "shellCommand": "set PORT=${workerPort} && bun run mock-server.ts",
+        "unixShellCommand": "PORT=${workerPort} bun run mock-server.ts",
         "manualCommand": "PORT=${workerPort} bun run mock-server.ts"
       },
       "startPolicy": "if-dead",
