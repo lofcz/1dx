@@ -13,8 +13,11 @@ import type { OneDxAction, OneDxConfig, OneDxService } from "./config.ts";
 import { resolveServiceStartCommand } from "./shell-command.ts";
 import {
   LINUX_TERMINALS,
+  buildKonsoleTabsFile,
+  linuxBatchLaunchArgs,
   linuxLaunchArgs,
   shouldRunCloseOnFinishInline,
+  terminalSupportsBatchTabs,
 } from "./linux-terminal.ts";
 
 const IS_WIN = platform() === "win32";
@@ -479,7 +482,16 @@ function focusWtTab(index: number) {
 }
 
 function findLinuxTerminal() {
-  for (const terminal of LINUX_TERMINALS) {
+  const preferred = process.env.KONSOLE_VERSION || process.env.KONSOLE_DBUS_SERVICE
+    ? "konsole"
+    : process.env.GNOME_TERMINAL_SERVICE || process.env.GNOME_TERMINAL_SCREEN
+      ? "gnome-terminal"
+      : null;
+  const candidates = preferred
+    ? [preferred, ...LINUX_TERMINALS.filter((name) => name !== preferred)]
+    : LINUX_TERMINALS;
+
+  for (const terminal of candidates) {
     try {
       execSync(`which ${terminal}`, { stdio: "pipe" });
       return terminal;
@@ -488,6 +500,43 @@ function findLinuxTerminal() {
     }
   }
   return null;
+}
+
+function flushLinuxTerminalQueue(projectRoot: string) {
+  const tabs = terminalQueue.splice(0).map((tab) => ({
+    title: tab.title ?? tab.safeTitle,
+    tempFile: tab.tempFile,
+  }));
+  if (tabs.length === 0) return;
+
+  const terminal = findLinuxTerminal();
+  if (!terminal) {
+    for (const tab of tabs) {
+      spawn("bash", [tab.tempFile], { detached: true, stdio: "ignore", cwd: projectRoot }).unref();
+    }
+    return;
+  }
+
+  if (terminalSupportsBatchTabs(terminal)) {
+    const tabsFile = join(getProjectTempDir(projectRoot), ".temp-linux-tabs");
+    writeFileSync(tabsFile, buildKonsoleTabsFile(tabs, projectRoot));
+    const launch = linuxBatchLaunchArgs(terminal, tabs, tabsFile);
+    spawn(launch.command, launch.args, {
+      detached: true,
+      stdio: "ignore",
+      cwd: projectRoot,
+    }).unref();
+    return;
+  }
+
+  for (const tab of tabs) {
+    const launch = linuxLaunchArgs(terminal, tab.title, tab.tempFile);
+    spawn(launch.command, launch.args, {
+      detached: true,
+      stdio: "ignore",
+      cwd: projectRoot,
+    }).unref();
+  }
 }
 
 // cmd.exe treats & | < > ^ as command operators even inside an `echo` argument.
@@ -581,19 +630,8 @@ function spawnTerminal(
     return;
   }
 
-  if (IS_MAC) {
+  if (IS_MAC || IS_LINUX) {
     terminalQueue.push({ safeTitle, tempFile, shouldPersistShell, title });
-    return;
-  }
-
-  const terminal = findLinuxTerminal();
-  if (terminal) {
-    const launch = linuxLaunchArgs(terminal, title, tempFile);
-    spawn(launch.command, launch.args, {
-      detached: true,
-      stdio: "ignore",
-      cwd: projectRoot,
-    }).unref();
     return;
   }
 
@@ -644,6 +682,11 @@ function flushTerminalQueue(projectRoot: string, options?: { restoreFocus?: bool
       }
     }
     terminalQueue.length = 0;
+    return;
+  }
+
+  if (IS_LINUX) {
+    flushLinuxTerminalQueue(projectRoot);
     return;
   }
 
