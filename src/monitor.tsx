@@ -11,6 +11,11 @@ import { execSync, spawn, spawnSync } from "child_process";
 import { killPortProcess } from "kill-port-process";
 import type { OneDxAction, OneDxConfig, OneDxService } from "./config.ts";
 import { resolveServiceStartCommand } from "./shell-command.ts";
+import {
+  LINUX_TERMINALS,
+  linuxLaunchArgs,
+  shouldRunCloseOnFinishInline,
+} from "./linux-terminal.ts";
 
 const IS_WIN = platform() === "win32";
 const IS_MAC = platform() === "darwin";
@@ -474,8 +479,7 @@ function focusWtTab(index: number) {
 }
 
 function findLinuxTerminal() {
-  const terminals = ["gnome-terminal", "konsole", "xfce4-terminal", "mate-terminal", "xterm"];
-  for (const terminal of terminals) {
+  for (const terminal of LINUX_TERMINALS) {
     try {
       execSync(`which ${terminal}`, { stdio: "pipe" });
       return terminal;
@@ -555,6 +559,10 @@ function spawnTerminal(
   closeOnFinish = false,
 ) {
   const tempFile = createTerminalScript(projectRoot, id, title, command, manualCommand, closeOnFinish);
+  if (shouldRunCloseOnFinishInline(IS_WIN, closeOnFinish)) {
+    spawn("bash", [tempFile], { detached: true, stdio: "ignore", cwd: projectRoot }).unref();
+    return;
+  }
   const safeTitle = id.charAt(0).toUpperCase() + id.slice(1);
   const shouldPersistShell = command === "cmd" || command === "powershell" || command === "bash";
 
@@ -580,14 +588,8 @@ function spawnTerminal(
 
   const terminal = findLinuxTerminal();
   if (terminal) {
-    const argsByTerminal: Record<string, string[]> = {
-      "gnome-terminal": ["--tab", "--title", safeTitle, "--", "bash", tempFile],
-      "konsole": ["--new-tab", "-e", "bash", tempFile],
-      "xfce4-terminal": ["--tab", "--title", safeTitle, "-e", `bash ${tempFile}`],
-      "mate-terminal": ["--tab", "--title", safeTitle, "-e", `bash ${tempFile}`],
-      "xterm": ["-title", safeTitle, "-e", "bash", tempFile],
-    };
-    spawn(terminal, argsByTerminal[terminal] || ["-e", "bash", tempFile], {
+    const launch = linuxLaunchArgs(terminal, title, tempFile);
+    spawn(launch.command, launch.args, {
       detached: true,
       stdio: "ignore",
       cwd: projectRoot,
@@ -1062,6 +1064,62 @@ function resolveStartupCommand(service: OneDxService, running: boolean) {
   };
 }
 
+const INLINE_START_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function runInlineStartCommand(
+  projectRoot: string,
+  service: OneDxService,
+  command: string,
+  manualCommand: string | undefined,
+  onLog: (color: string, text: string) => void,
+): Promise<boolean> {
+  const tempFile = createTerminalScript(
+    projectRoot,
+    service.id,
+    service.title,
+    command,
+    manualCommand,
+    true,
+  );
+  const color = service.color || "white";
+  const child = spawn("bash", [tempFile], {
+    cwd: projectRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const append = (buf: Buffer) => {
+    for (const line of buf.toString().split(/\r?\n/)) {
+      const trimmed = line.replace(/\r/g, "").trimEnd();
+      if (trimmed) onLog(color, `  ${trimmed}`);
+    }
+  };
+  child.stdout?.on("data", append);
+  child.stderr?.on("data", append);
+
+  const healthPort = service.health?.type === "port" ? service.health.port : null;
+  const deadline = Date.now() + INLINE_START_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    if (healthPort && await isPortInUse(healthPort)) {
+      onLog("green", `${service.title} is up on :${healthPort}`);
+      child.unref();
+      return true;
+    }
+    if (child.exitCode !== null) {
+      if (child.exitCode === 0) {
+        onLog("green", `${service.title} finished`);
+        return true;
+      }
+      onLog("red", `${service.title} exited with code ${child.exitCode}`);
+      return false;
+    }
+    await sleep(1000);
+  }
+
+  onLog("red", `${service.title} timed out after ${INLINE_START_TIMEOUT_MS / 1000}s`);
+  return false;
+}
+
 function Startup({ projectRoot, config, onComplete }: { projectRoot: string; config: OneDxConfig; onComplete: () => void }) {
   const [, setStep] = useState(0);
   const [logs, setLogs] = useState<Array<{ color: string; text: string }>>([]);
@@ -1202,13 +1260,32 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
         const startupCommand = resolveStartupCommand(service, running);
         if (!startupCommand) continue;
 
+        const closeOnFinish = service.closeTerminalOnFinish ?? false;
+        if (shouldRunCloseOnFinishInline(IS_WIN, closeOnFinish)) {
+          addLog(service.color || "white", `Starting ${service.title}...`);
+          setShowSpinner(true);
+          setSpinnerMessage(`Starting ${service.title}...`);
+          const ok = await runInlineStartCommand(
+            projectRoot,
+            service,
+            startupCommand.command,
+            startupCommand.manualCommand,
+            addLog,
+          );
+          setShowSpinner(false);
+          if (!ok) {
+            addLog("red", `${service.title} failed to start`);
+          }
+          continue;
+        }
+
         spawnTerminal(
           projectRoot,
           service.id,
           service.title,
           startupCommand.command,
           startupCommand.manualCommand,
-          service.closeTerminalOnFinish ?? false,
+          closeOnFinish,
         );
         addLog(service.color || "white", `Queued: ${service.title}`);
       }
@@ -1443,13 +1520,25 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         setMessage("Starting dead services...");
         for (const service of deadServices) {
           if (!service.start) continue;
+          const closeOnFinish = service.closeTerminalOnFinish ?? false;
+          const command = resolveServiceStartCommand(service.start, IS_WIN);
+          if (shouldRunCloseOnFinishInline(IS_WIN, closeOnFinish)) {
+            await runInlineStartCommand(
+              projectRoot,
+              service,
+              command,
+              service.start.manualCommand,
+              (_color, text) => setMessage(text),
+            );
+            continue;
+          }
           spawnTerminal(
             projectRoot,
             service.id,
             service.title,
-            resolveServiceStartCommand(service.start, IS_WIN),
+            command,
             service.start.manualCommand,
-            service.closeTerminalOnFinish ?? false,
+            closeOnFinish,
           );
         }
         flushTerminalQueue(projectRoot);
