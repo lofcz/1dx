@@ -35,7 +35,9 @@ test("resize and fresh props keep one command alive, preserving full diagnostics
   try {
     await waitFor(() => existsSync(join(cwd, "runs")));
     app.rerender(<CommandRunner cwd={cwd} command={process.execPath} args={[script]} label="Check" maxLines={2} onDone={(success, output) => completions.push({ success, output })} />);
-    await waitFor(() => app.frame().includes("partial ž"));
+    await waitFor(() => app.frame().includes("partial ž")).catch((cause) => {
+      throw new Error(`Missing streamed output in frame: ${JSON.stringify(app.frame())}`, { cause });
+    });
     writeFileSync(join(cwd, "finish"), "");
     await waitFor(() => completions.length === 1);
     expect(readFileSync(join(cwd, "runs"), "utf8")).toBe("run\n");

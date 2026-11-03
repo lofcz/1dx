@@ -2,6 +2,7 @@ import React, { useEffect, useEffectEvent, useMemo, useState } from "react";
 import { Box, Text, useAnimation } from "ink";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { stripVTControlCharacters } from "node:util";
+import { StringDecoder } from "node:string_decoder";
 
 const MAX_OUTPUT_CHARS = 1024 * 1024;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -59,18 +60,27 @@ export function CommandRunner({ command, args, label, cwd, onDone, maxLines = 15
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, FORCE_COLOR: "0" },
     });
-    // Decode across chunks so split UTF-8 characters and lines stay intact.
-    child.stdout?.setEncoding("utf8").on("data", append);
-    child.stderr?.setEncoding("utf8").on("data", append);
-    child.once("close", (code) => finish(code === 0));
+    // Decode each pipe independently. Reading buffers also avoids Bun's
+    // setEncoding() stream stalling when a chunk ends mid-character.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const appendStdout = (data: Buffer) => append(stdoutDecoder.write(data));
+    const appendStderr = (data: Buffer) => append(stderrDecoder.write(data));
+    child.stdout?.on("data", appendStdout);
+    child.stderr?.on("data", appendStderr);
+    child.once("close", (code) => {
+      if (settled) return;
+      append(stdoutDecoder.end() + stderrDecoder.end());
+      finish(code === 0);
+    });
     child.once("error", (error) => {
       append(`\n${error.message}\n`);
       finish(false);
     });
     return () => {
       settled = true;
-      child.stdout?.off("data", append);
-      child.stderr?.off("data", append);
+      child.stdout?.off("data", appendStdout);
+      child.stderr?.off("data", appendStderr);
       terminateCommand(child);
     };
   }, [command, argsKey, cwd]);
