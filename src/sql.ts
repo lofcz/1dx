@@ -13,11 +13,11 @@ const SUPABASE_VALUE_FLAGS = new Set([
   "--workdir",
 ]);
 const SUPABASE_BOOLEAN_FLAGS = new Set([
-  "--create-ticket",
   "--debug",
   "--experimental",
   "--linked",
   "--local",
+  "--read-only",
   "--yes",
 ]);
 
@@ -121,6 +121,13 @@ const readSqlInput = (args: string[]) => {
       const { value, nextIndex } = getFlagValue(token, args, index);
       offset = parsePositiveInteger(value, "--offset", 0);
       index = nextIndex;
+      continue;
+    }
+
+    // --remote has an optional value that must stay attached with '='.
+    // A bare --remote must never consume the following SQL argument.
+    if (token === "--remote" || token.startsWith("--remote=")) {
+      forwardedArgs.push(token);
       continue;
     }
 
@@ -323,6 +330,7 @@ export function printSqlHelp() {
   bunx 1dxway sql --file ./query.sql
   bunx 1dxway sql "SELECT * FROM pg_tables" --output table
   bunx 1dxway sql "SELECT * FROM pg_tables" --limit 250 --offset 250
+  bunx 1dxway sql "SELECT * FROM pg_tables" --read-only --remote
 
 \x1b[33mOptions:\x1b[0m
   \x1b[32m-o, --output\x1b[0m    Output format: json, table, csv (default: json)
@@ -337,7 +345,10 @@ export function printSqlHelp() {
   Non-row statements (DDL/DML command tags) and table/CSV output are passed through unchanged.
 
 \x1b[33mSupabase flags:\x1b[0m
-  Pass through flags like --linked, --local, --db-url, --profile, or --workdir.
+  Queries target the local stack by default (Supabase CLI v3).
+  Use --remote for the linked project, or --remote=<ref|branch|postgres-url>.
+  Use --read-only for hosted reads, or explicitly pass --yes for hosted writes.
+  Flags such as --profile, --workdir, and --debug are passed through.
 `);
 }
 
@@ -393,6 +404,7 @@ export function runSqlCommand(rawArgs: string[]) {
       writeOutputAndExit(result.stdout ?? "", result.stderr ?? "", 0);
     }
 
+    if (result.stderr) process.stderr.write(result.stderr);
     printJsonResult(rows, parsed.limit, parsed.offset);
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);

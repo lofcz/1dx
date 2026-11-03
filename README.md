@@ -21,6 +21,25 @@ Run the monitor after setup:
 bunx 1dxway start
 ```
 
+## SQL with Supabase CLI v3
+
+Queries use the project's installed Supabase CLI and target the local stack by default:
+
+```bash
+bunx 1dxway sql "SELECT * FROM pg_tables"
+bunx 1dxway sql "SELECT * FROM pg_tables" --read-only --remote
+bunx 1dxway sql --file ./query.sql --read-only --remote=my-branch
+```
+
+Use `--remote` for the linked project, or `--remote=<project-ref|branch|postgres-url>`
+for another target. Attach target values with `=`. Hosted reads can use `--read-only`;
+hosted writes require an explicit `--yes` for unattended execution. JSON results stay
+on stdout, while the CLI's selected target and diagnostics are written to stderr.
+
+The detected preset runs the host project's `supabase:start`, `supabase:up`,
+`supabase:up:all`, `supabase:reset`, and `supabase:types` scripts. Keep those scripts
+compatible with the installed CLI; local workflows need no `--remote` flag.
+
 ## Publish
 
 The repo includes a manual GitHub Actions workflow at `.github/workflows/release.yml`.
