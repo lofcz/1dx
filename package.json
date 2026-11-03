@@ -38,17 +38,17 @@
     "prepublishOnly": "bun run typecheck && bun run check && bun test"
   },
   "devDependencies": {
-    "@types/bun": "1.3.14",
-    "@types/react": "^19.2.17"
+    "@types/bun": "1.4.4",
+    "@types/react": "^19.3.0"
   },
   "peerDependencies": {
-    "ink": "^7.1.1",
-    "react": "^19.2.8",
+    "ink": "^8.0.0",
+    "react": "^19.3.0",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "kill-port-process": "^4.0.2",
-    "smol-toml": "^1.7.1",
-    "zod": "^4.4.3"
+    "kill-port-process": "^5.0.0",
+    "smol-toml": "^1.9.1",
+    "zod": "^4.6.7"
   }
 }

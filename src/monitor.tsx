@@ -1,8 +1,7 @@
 #!/usr/bin/env bun
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { render, Box, Text, useApp, useInput, useWindowSize } from "ink";
-import stream from "stream";
+import { render, Box, Text, useApp, useInput, useWindowSize, useBoxMetrics, type DOMElement } from "ink";
 import net from "net";
 import { arch, platform, tmpdir } from "os";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
@@ -10,6 +9,8 @@ import { join } from "path";
 import { execSync, spawn, spawnSync } from "child_process";
 import { killPortProcess } from "kill-port-process";
 import type { OneDxAction, OneDxConfig, OneDxService } from "./config.ts";
+import { ActionMenu } from "./action-menu.tsx";
+import { CommandRunner } from "./command-runner.tsx";
 import { resolveServiceStartCommand } from "./shell-command.ts";
 import {
   LINUX_TERMINALS,
@@ -107,101 +108,6 @@ function ServiceRow({
       <Box>
         {status.pid && !stopping && <Text dimColor>PID {status.pid}</Text>}
       </Box>
-    </Box>
-  );
-}
-
-function CommandRunner({
-  command,
-  args,
-  label,
-  onDone,
-  maxLines = 15,
-}: {
-  command: string;
-  args: string[];
-  label: string;
-  onDone: (success: boolean, output: string) => void;
-  maxLines?: number;
-}) {
-  const [lines, setLines] = useState<string[]>([]);
-  const [status, setStatus] = useState<"running" | "succeeded" | "failed">("running");
-  const [frame, setFrame] = useState(0);
-  const linesRef = useRef<string[]>([]);
-
-  useEffect(() => {
-    if (status !== "running") return;
-    const interval = setInterval(() => {
-      setFrame((current) => (current + 1) % SPINNER_FRAMES.length);
-    }, 80);
-    return () => clearInterval(interval);
-  }, [status]);
-
-  useEffect(() => {
-    const child = spawn(command, args, {
-      cwd: process.cwd(),
-      shell: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, FORCE_COLOR: "0" },
-    });
-
-    const appendData = (data: Buffer) => {
-      const raw = data.toString();
-      const chunks = raw.split(/\r?\n|\r/);
-      for (const chunk of chunks) {
-        const clean = chunk.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").trim();
-        if (!clean) continue;
-        if (raw.includes("\r") && !raw.includes("\n") && linesRef.current.length > 0) {
-          linesRef.current[linesRef.current.length - 1] = clean;
-        } else {
-          linesRef.current.push(clean);
-        }
-      }
-      linesRef.current = linesRef.current.slice(-maxLines);
-      setLines([...linesRef.current]);
-    };
-
-    child.stdout?.on("data", appendData);
-    child.stderr?.on("data", appendData);
-
-    child.on("close", (code) => {
-      setStatus(code === 0 ? "succeeded" : "failed");
-      onDone(code === 0, linesRef.current.join("\n"));
-    });
-
-    child.on("error", (error) => {
-      linesRef.current = [...linesRef.current, error.message];
-      setLines([...linesRef.current]);
-      setStatus("failed");
-      onDone(false, error.message);
-    });
-
-    return () => {
-      try {
-        child.kill();
-      } catch {
-        // ignore
-      }
-    };
-  }, [command, args, maxLines, onDone]);
-
-  const statusIcon = status === "running"
-    ? <Text dimColor>{SPINNER_FRAMES[frame]}</Text>
-    : status === "succeeded"
-      ? <Text color="green">✓</Text>
-      : <Text color="red">✗</Text>;
-
-  return (
-    <Box flexDirection="column">
-      <Text>{statusIcon} {label}</Text>
-      <Text dimColor>  $ {command} {args.join(" ")}</Text>
-      {lines.length > 0 && (
-        <Box flexDirection="column" marginLeft={2} marginTop={1}>
-          {lines.map((line, index) => (
-            <Text key={`${index}-${line}`} dimColor>{line}</Text>
-          ))}
-        </Box>
-      )}
     </Box>
   );
 }
@@ -570,7 +476,7 @@ function escapeBashDquote(text: string) {
   return text.replace(/[\\"`$]/g, (char) => `\\${char}`);
 }
 
-function createTerminalScript(
+export function createTerminalScript(
   projectRoot: string,
   id: string,
   title: string,
@@ -590,7 +496,7 @@ function createTerminalScript(
     const executionBlock = isInteractive
       ? `cls\necho.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\ncmd /k`
       : closeOnFinish
-        ? `echo.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\n${command}\nexit /b 0`
+        ? `echo.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\n${command}\nexit /b %errorlevel%`
         : `echo.\necho ============================================================\necho   ${safeTitle}\necho ============================================================\necho Manual command: ${safeManual}\necho.\n${command}\necho.\nif exist "${exitFlag}" exit /b 0\necho Process exited. Waiting for monitor shutdown...\npowershell -NoProfile -Command "try{$c=[IO.Pipes.NamedPipeClientStream]::new('.','${getExitPipeName(projectRoot)}','In');$c.Connect(60000);$c.ReadByte()|Out-Null;$c.Close()}catch{}"\nexit /b 0`;
     const scriptContent = `@echo off\ntitle ${safeTitle}\ncd /d "${projectRoot}"\n${executionBlock}\n`;
     const tempFile = join(tempDir, `.temp-${id}.bat`);
@@ -604,9 +510,9 @@ function createTerminalScript(
   const executionBlock = isInteractive
     ? `clear\necho ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\nexec bash`
     : closeOnFinish
-      ? `echo ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\n${command}\nexit 0`
-      : `echo ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\n${command}\necho ""\nif [ -f "${exitFlag}" ]; then exit 0; fi\necho "Process exited. Waiting for monitor shutdown..."\nwhile true; do sleep 2; if [ -f "${exitFlag}" ]; then exit 0; fi; done`;
-  const scriptContent = `#!/usr/bin/env bash\ncd "${projectRoot}"\n${executionBlock}\n`;
+      ? `echo ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\n${command}\nexit $?`
+      : `echo ""\necho "============================================================"\necho "  ${safeTitle}"\necho "============================================================"\necho "Manual command: ${safeManual}"\necho ""\n${command}\necho ""\nif [ -f "${escapeBashDquote(exitFlag)}" ]; then exit 0; fi\necho "Process exited. Waiting for monitor shutdown..."\nwhile kill -0 ${process.pid} 2>/dev/null && [ ! -f "${escapeBashDquote(exitFlag)}" ]; do sleep 2; done`;
+  const scriptContent = `#!/usr/bin/env bash\ncd "${escapeBashDquote(projectRoot)}" || exit 1\n${executionBlock}\n`;
   const tempFile = join(tempDir, `.temp-${id}.sh`);
   writeFileSync(tempFile, scriptContent);
   chmodSync(tempFile, 0o755);
@@ -954,30 +860,6 @@ function getSupabaseMigrationOrderingGuard(output: string) {
   return { migrations };
 }
 
-function SyncStdout({ originalStdout }: { originalStdout: NodeJS.WriteStream }) {
-  return class extends stream.Writable {
-    originalStdout = originalStdout;
-    isTTY = originalStdout.isTTY;
-    columns = originalStdout.columns;
-    rows = originalStdout.rows;
-
-    constructor() {
-      super();
-      originalStdout.on("resize", () => {
-        this.columns = originalStdout.columns;
-        this.rows = originalStdout.rows;
-        this.emit("resize");
-      });
-    }
-
-    override _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void) {
-      this.originalStdout.write("\x1b[?2026h");
-      this.originalStdout.write(chunk, encoding);
-      this.originalStdout.write("\x1b[?2026l", callback);
-    }
-  };
-}
-
 function getManagedServices(services: OneDxService[]) {
   return services.filter((service) => !service.ambient);
 }
@@ -1081,27 +963,6 @@ function cleanupRuntime(projectRoot: string, config: OneDxConfig) {
   try { rmSync(getProjectTempDir(projectRoot), { recursive: true, force: true }); } catch {}
 }
 
-function restoreTerminalAndPrintExit(projectName: string) {
-  process.stdin.setRawMode?.(false);
-  writeMainTerminalStatusLine(`\x1b[36m${projectName} Dev Monitor stopped.\x1b[0m`);
-  process.stdout.write("Terminals and configured services have been closed.\n");
-}
-
-function resetMainTerminalView() {
-  // Reset scroll region, clear scrollback + screen, and park the cursor at row 1.
-  // Interactive external commands can leave the viewport scrolled; 2J alone does not fix that.
-  process.stdout.write("\x1b[?25h\x1b[?2026l\x1b[r\x1b[2J\x1b[3J\x1b[1;1H");
-}
-
-function clearMainTerminal() {
-  resetMainTerminalView();
-}
-
-function writeMainTerminalStatusLine(text: string) {
-  resetMainTerminalView();
-  process.stdout.write(`\x1b[1;1H${text}\n`);
-}
-
 function resolveStartupCommand(service: OneDxService, running: boolean) {
   if (!service.start) {
     return null;
@@ -1154,22 +1015,28 @@ async function runInlineStartCommand(
   };
   child.stdout?.on("data", append);
   child.stderr?.on("data", append);
+  let spawnError: Error | null = null;
+  child.once("error", (error) => { spawnError = error; });
 
   const healthPort = service.health?.type === "port" ? service.health.port : null;
   const deadline = Date.now() + INLINE_START_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
+    if (spawnError) {
+      onLog("red", `${service.title} failed: ${spawnError.message}`);
+      return false;
+    }
     if (healthPort && await isPortInUse(healthPort)) {
       onLog("green", `${service.title} is up on :${healthPort}`);
       child.unref();
       return true;
     }
-    if (child.exitCode !== null) {
+    if (child.exitCode !== null || child.signalCode !== null) {
       if (child.exitCode === 0) {
         onLog("green", `${service.title} finished`);
         return true;
       }
-      onLog("red", `${service.title} exited with code ${child.exitCode}`);
+      onLog("red", `${service.title} exited with ${child.signalCode ?? `code ${child.exitCode}`}`);
       return false;
     }
     await sleep(1000);
@@ -1398,8 +1265,8 @@ function Startup({ projectRoot, config, onComplete }: { projectRoot: string; con
   );
 }
 
-function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config: OneDxConfig; onExit: () => void }) {
-  useApp();
+export function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config: OneDxConfig; onExit: () => void }) {
+  const { suspendTerminal } = useApp();
   const { rows } = useWindowSize();
   const [statuses, setStatuses] = useState<Record<string, ServiceStatus>>({});
   const [lastUpdate, setLastUpdate] = useState(new Date());
@@ -1410,12 +1277,16 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
   const [stoppingServiceIds, setStoppingServiceIds] = useState<string[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [activeCommand, setActiveCommand] = useState<ActiveCommand | null>(null);
+  const commandViewportRef = useRef<DOMElement>(null);
+  const commandContentRef = useRef<DOMElement>(null);
+  const commandViewport = useBoxMetrics(commandViewportRef);
+  const commandContent = useBoxMetrics(commandContentRef);
 
   const busyRef = useRef(false);
   const refreshingRef = useRef(false);
   const activeCommandRef = useRef<ActiveCommand | null>(null);
   const statusesRef = useRef<Record<string, ServiceStatus>>({});
-  const externalReturnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const messageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [commandKey, setCommandKey] = useState(0);
 
   const managedServices = useMemo(
@@ -1439,7 +1310,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
 
   useEffect(() => {
     if (selectedIndex >= menuItems.length) {
-      setSelectedIndex(menuItems.length - 1);
+      setSelectedIndex(Math.max(0, menuItems.length - 1));
     }
   }, [menuItems.length, selectedIndex]);
 
@@ -1473,7 +1344,9 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
       busyRef.current = false;
     }
 
-    setTimeout(() => {
+    if (messageTimerRef.current) clearTimeout(messageTimerRef.current);
+    messageTimerRef.current = setTimeout(() => {
+      messageTimerRef.current = null;
       setMessage(null);
       setStoppingServiceIds([]);
       if (!releaseBusyImmediately) {
@@ -1484,12 +1357,10 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
   }, []);
 
   const dismissWaitingState = useCallback(() => {
-    if (externalReturnTimerRef.current) {
-      clearTimeout(externalReturnTimerRef.current);
-      externalReturnTimerRef.current = null;
+    if (messageTimerRef.current) {
+      clearTimeout(messageTimerRef.current);
+      messageTimerRef.current = null;
     }
-    clearMainTerminal();
-    process.stdout.write("\x1b[?2026h\x1b[?25l");
     activeCommandRef.current = null;
     setActiveCommand(null);
     setRecoveryPrompt(null);
@@ -1499,27 +1370,18 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     busyRef.current = false;
   }, []);
 
-  const finishExternalCommand = useCallback((label: string, succeeded: boolean, errorText?: string) => {
-    const message = succeeded
-      ? `\x1b[32m✓ ${label} completed.\x1b[0m`
-      : `\x1b[31m✗ ${label} failed${errorText ? `: ${errorText}` : ""}.\x1b[0m`;
-    writeMainTerminalStatusLine(message);
-    setWaitingForKey(true);
-    externalReturnTimerRef.current = setTimeout(() => {
-      dismissWaitingState();
-    }, 1000);
-  }, [dismissWaitingState]);
-
   useEffect(() => {
     return () => {
-      if (externalReturnTimerRef.current) {
-        clearTimeout(externalReturnTimerRef.current);
+      if (messageTimerRef.current) {
+        clearTimeout(messageTimerRef.current);
       }
     };
   }, []);
 
   const handleAction = useCallback(async (value: string) => {
     if (busyRef.current) return;
+    if (messageTimerRef.current) clearTimeout(messageTimerRef.current);
+    setMessage(null);
     busyRef.current = true;
     setBusy(true);
 
@@ -1531,20 +1393,18 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
     }
 
     if (action.mode === "external" && action.command) {
-      resetMainTerminalView();
       try {
-        const result = spawnSync(action.command, action.args || [], { cwd: projectRoot, stdio: "inherit", shell: true });
-        if (result.error) {
-          finishExternalCommand(action.label, false, result.error.message);
-        } else if (result.status !== 0) {
-          finishExternalCommand(action.label, false, `exit code ${result.status ?? "unknown"}`);
-        } else {
-          finishExternalCommand(action.label, true);
-        }
+        await suspendTerminal(() => {
+          const result = spawnSync(action.command, action.args || [], { cwd: projectRoot, stdio: "inherit", shell: true });
+          if (result.error) throw result.error;
+          if (result.status !== 0) throw new Error(`exit code ${result.status ?? result.signal ?? "unknown"}`);
+        });
+        setMessage(`✓ ${action.label} completed`);
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error);
-        finishExternalCommand(action.label, false, text);
+        setMessage(`✗ ${action.label} failed: ${text}`);
       }
+      dismissTransientMessage(2000, true);
       return;
     }
 
@@ -1603,12 +1463,8 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         }
         flushTerminalQueue(projectRoot);
         setMessage(`✓ Started: ${deadServices.map((service) => service.id).join(", ")}`);
-        setTimeout(() => {
-          setMessage(null);
-          refreshStatuses();
-        }, 2000);
-        setBusy(false);
-        busyRef.current = false;
+        await refreshStatuses();
+        dismissTransientMessage(2000, true);
         return;
       case "open-url":
         if (!action.url) {
@@ -1678,7 +1534,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         setBusy(false);
         busyRef.current = false;
     }
-  }, [deadServices, dismissTransientMessage, finishExternalCommand, managedServices, menuItems, onExit, projectRoot, refreshStatuses]);
+  }, [deadServices, dismissTransientMessage, suspendTerminal, managedServices, menuItems, onExit, projectRoot, refreshStatuses]);
 
   const retryRecovery = useCallback(() => {
     if (!recoveryPrompt) return;
@@ -1699,20 +1555,9 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
 
   const onCommandDone = useCallback((success: boolean, output: string) => {
     const currentAction = activeCommandRef.current?.action;
-    if (!currentAction) {
-      setTimeout(() => {
-        activeCommandRef.current = null;
-        setActiveCommand(null);
-        setMessage(null);
-        setBusy(false);
-        busyRef.current = false;
-      }, 500);
-      return;
-    }
-
     if (success) {
       setRecoveryPrompt(null);
-      if (currentAction.onSuccess) {
+      if (currentAction?.onSuccess) {
         const nextCommand: ActiveCommand = {
           command: currentAction.onSuccess.command,
           args: currentAction.onSuccess.args || [],
@@ -1724,7 +1569,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         return;
       }
 
-      setTimeout(() => {
+      messageTimerRef.current = setTimeout(() => {
         activeCommandRef.current = null;
         setActiveCommand(null);
         setMessage(null);
@@ -1734,7 +1579,7 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
       return;
     }
 
-    if (currentAction.recovery?.kind === "supabaseMigrationOrderingGuard") {
+    if (currentAction?.recovery?.kind === "supabaseMigrationOrderingGuard") {
       const prompt = getSupabaseMigrationOrderingGuard(output);
       if (prompt) {
         setRecoveryPrompt({ migrations: prompt.migrations, retryAction: currentAction.recovery.retry });
@@ -1780,6 +1625,15 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
         }
       }
 
+      if (key.home || key.end) {
+        setSelectedIndex(key.home ? 0 : Math.max(0, menuItems.length - 1));
+        return;
+      }
+      if (key.pageUp || key.pageDown) {
+        const direction = key.pageUp ? -1 : 1;
+        setSelectedIndex((index) => Math.max(0, Math.min(menuItems.length - 1, index + direction * Math.max(1, Math.floor(rows / 2)))));
+        return;
+      }
       if (key.upArrow) {
         setSelectedIndex((index) => (index > 0 ? index - 1 : index));
         return;
@@ -1791,23 +1645,20 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
       }
 
       if (key.return) {
-        handleAction(menuItems[selectedIndex].value);
+        const selected = menuItems[selectedIndex];
+        if (selected) handleAction(selected.value);
       }
-    }, [dismissWaitingState, handleAction, menuItems, recoveryPrompt, retryRecovery, selectedIndex, waitingForKey]),
+    }, [dismissWaitingState, handleAction, menuItems, recoveryPrompt, retryRecovery, rows, selectedIndex, waitingForKey]),
     { isActive: !busy || waitingForKey || recoveryPrompt !== null },
   );
 
-  if (waitingForKey && busyRef.current && !activeCommandRef.current) {
-    return null;
-  }
-
   return (
-    <Box flexDirection="column" paddingX={1} paddingTop={1} height={rows ? rows - 1 : undefined} overflow="hidden">
-      <Box marginBottom={1}>
-        <Text bold color="cyan">{config.project.name} / 1dx {ONE_DX_VERSION}</Text>
+    <Box flexDirection="column" paddingX={1} paddingTop={1} height={Math.max(1, rows - 1)} overflow="hidden">
+      <Box marginBottom={1} flexShrink={0}>
+        <Text bold color="cyan" wrap="truncate-end">{config.project.name} / 1dx {ONE_DX_VERSION}</Text>
       </Box>
 
-      <Box flexDirection="column" marginBottom={1}>
+      <Box flexDirection="column" marginBottom={1} maxHeight={Math.max(0, Math.floor(rows / 2) - 2)} overflow="hidden">
         <Text dimColor>{"─".repeat(55)}</Text>
         {config.services.map((service) => (
           <ServiceRow
@@ -1822,110 +1673,83 @@ function Monitor({ projectRoot, config, onExit }: { projectRoot: string; config:
       </Box>
 
       {activeCommand ? (
-        <Box flexDirection="column" marginTop={1}>
-          <CommandRunner
-            key={commandKey}
-            command={activeCommand.command}
-            args={activeCommand.args}
-            label={activeCommand.label}
-            onDone={onCommandDone}
-            maxLines={Math.max(5, rows - 18)}
-          />
-          {recoveryPrompt ? (
-            <Box flexDirection="column" marginTop={1}>
-              <Text color="yellow">Command was blocked by out-of-order migration guard. Retry with the relaxed mode?</Text>
-              {recoveryPrompt.migrations.map((migration) => (
-                <Text key={migration} dimColor>  {migration}</Text>
-              ))}
-              <Text dimColor>Enter or a = retry, Esc or c = cancel</Text>
-            </Box>
-          ) : waitingForKey && (
-            <Box marginTop={1}>
-              <Text color="yellow">{message}</Text>
-            </Box>
-          )}
+        <Box
+          ref={commandViewportRef}
+          flexDirection="column"
+          flexGrow={1}
+          minHeight={1}
+          overflow="hidden"
+          contentOffsetY={Math.max(0, commandContent.height - commandViewport.clientHeight)}
+        >
+          <Box ref={commandContentRef} flexDirection="column" flexShrink={0}>
+            <CommandRunner
+              key={commandKey}
+              cwd={projectRoot}
+              command={activeCommand.command}
+              args={activeCommand.args}
+              label={activeCommand.label}
+              onDone={onCommandDone}
+              maxLines={Math.max(5, rows - 18)}
+            />
+            {recoveryPrompt ? (
+              <Box flexDirection="column" marginTop={1}>
+                <Text color="yellow">Command was blocked by out-of-order migration guard. Retry with the relaxed mode?</Text>
+                {recoveryPrompt.migrations.map((migration) => (
+                  <Text key={migration} dimColor>  {migration}</Text>
+                ))}
+                <Text dimColor>Enter or a = retry, Esc or c = cancel</Text>
+              </Box>
+            ) : waitingForKey && (
+              <Box marginTop={1}>
+                <Text color="yellow">{message}</Text>
+              </Box>
+            )}
+          </Box>
         </Box>
       ) : message ? (
         <Box marginTop={1}>
           <Text color="yellow">{message}</Text>
         </Box>
       ) : (
-        <Box flexDirection="column" marginTop={1}>
-          <Text dimColor>Actions (↑↓ Enter, or keys):</Text>
-          {menuItems.map((item, index) => (
-            <Text key={item.id} color={index === selectedIndex ? "cyan" : undefined}>
-              {index === selectedIndex ? "❯ " : "  "}{item.shortcut}. {item.label}
-            </Text>
-          ))}
-        </Box>
+        <ActionMenu items={menuItems} selectedIndex={selectedIndex} />
       )}
     </Box>
   );
 }
 
-function ExitScreen({ projectRoot, config }: RuntimeOptions) {
-  const { exit } = useApp();
-
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      exit();
-      cleanupRuntime(projectRoot, config);
-      restoreTerminalAndPrintExit(config.project.name);
-      process.exit(0);
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [projectRoot, config, exit]);
-
-  return (
-    <Box flexDirection="column" padding={1}>
-      <Spinner message={`Closing ${config.project.name} services...`} />
-    </Box>
-  );
-}
-
 function App({ projectRoot, config }: RuntimeOptions) {
-  const [mode, setMode] = useState<"startup" | "monitor" | "exiting">("startup");
-  // Stable callbacks. Passing a fresh closure re-fires child effects on every
-  // Ink re-render (resize, etc.), which for <Startup> means re-spawning services.
+  const { exit } = useApp();
+  const [mode, setMode] = useState<"startup" | "monitor">("startup");
   const enterMonitor = useCallback(() => setMode("monitor"), []);
-  const enterExiting = useCallback(() => setMode("exiting"), []);
+
+  // Keep raw-mode Ctrl+C available during startup and while actions are busy.
+  // Ink exits through waitUntilExit(), which owns all runtime cleanup.
+  useInput(() => {});
 
   if (mode === "startup") {
     return <Startup projectRoot={projectRoot} config={config} onComplete={enterMonitor} />;
   }
-
-  if (mode === "exiting") {
-    return <ExitScreen projectRoot={projectRoot} config={config} />;
-  }
-
-  return <Monitor projectRoot={projectRoot} config={config} onExit={enterExiting} />;
+  return <Monitor projectRoot={projectRoot} config={config} onExit={exit} />;
 }
 
 export function startMonitor(projectRoot: string, config: OneDxConfig) {
   ensureRuntimeDirs(projectRoot);
   setupExitPipe(projectRoot);
-  const WritableSyncStdout = SyncStdout({ originalStdout: process.stdout });
-  clearMainTerminal();
-
-  process.on("exit", () => {
-    process.stdout.write("\x1b[?25h");
-    process.stdout.write("\x1b[?2026l");
-    process.stdin.setRawMode?.(false);
+  const app = render(<App projectRoot={projectRoot} config={config} />, {
+    incrementalRendering: true,
   });
+  const unmount = () => app.unmount();
+  process.on("SIGINT", unmount);
+  process.on("SIGTERM", unmount);
 
-  process.on("SIGINT", () => {
+  return app.waitUntilExit().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  }).finally(() => {
+    process.off("SIGINT", unmount);
+    process.off("SIGTERM", unmount);
     cleanupRuntime(projectRoot, config);
-    restoreTerminalAndPrintExit(config.project.name);
-    process.exit(0);
-  });
-
-  process.on("SIGTERM", () => {
-    cleanupRuntime(projectRoot, config);
-    restoreTerminalAndPrintExit(config.project.name);
-    process.exit(0);
-  });
-
-  render(<App projectRoot={projectRoot} config={config} />, {
-    stdout: new WritableSyncStdout() as any,
+    process.stdout.write(`${config.project.name} Dev Monitor stopped.\n`);
+    process.exit(process.exitCode ?? 0);
   });
 }

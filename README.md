@@ -12,6 +12,9 @@ Run the installer from any Bun project:
 bunx 1dxway
 ```
 
+1dx uses Ink 8 and requires React 19.3 or later in the host project.
+Projects using React types should also use `@types/react` 19.3 or later.
+
 Run the monitor after setup:
 
 ```bash
